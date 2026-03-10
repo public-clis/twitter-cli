@@ -27,7 +27,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        # Lower bound follows requires-python (>=3.10) from upstream; the 3.13
+        # entry is restored from the fork's earlier CI work and verified green.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     # A job with no timeout inherits GitHub's 30-day ceiling: a hung dependency
     # install or a stalled test keeps the whole PR in "expected" state until
     # then. Bound it so a stall fails fast and visibly instead.

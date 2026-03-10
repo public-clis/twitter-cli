@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/jackwener/twitter-cli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jackwener/twitter-cli/actions/workflows/ci.yml)
 [![PyPI version](https://badge.fury.io/py/twitter-cli.svg)](https://pypi.org/project/twitter-cli/)
-[![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue.svg)](https://pypi.org/project/twitter-cli/)
+[![Python versions](https://img.shields.io/pypi/pyversions/twitter-cli.svg)](https://pypi.org/project/twitter-cli/)
 
 A terminal-first CLI for Twitter/X: read timelines, bookmarks, and user profiles without API keys.
 
