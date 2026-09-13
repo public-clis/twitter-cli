@@ -1103,6 +1103,14 @@ class TwitterClient:
             # a different TLS fingerprint on the same IP — a detection vector.
             cffi_session = _get_cffi_session()
             ct_headers = _gen_ct_headers()
+            # x.com serves a stripped-down logged-out shell (no ondemand.s
+            # JS bundle reference) to unauthenticated requests, which makes
+            # x_client_transaction's homepage regex match nothing and crash
+            # with "'NoneType' object has no attribute 'group'" inside
+            # get_ondemand_file_url. Attach the same session cookies used
+            # for API calls so we get the full authenticated app shell.
+            ct_headers["Cookie"] = self._cookie_string or "auth_token=%s; ct0=%s" % (
+                self._auth_token, self._ct0)
             home_page = cffi_session.get(
                 "https://x.com", headers=ct_headers, timeout=10,
             )

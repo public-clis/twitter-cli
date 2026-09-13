@@ -332,6 +332,59 @@ class TestBuildHeaders:
         assert headers["sec-ch-ua-platform-version"] == '""'
 
 
+# ── TwitterClient._ensure_client_transaction ─────────────────────────────
+
+class TestEnsureClientTransaction:
+    """x.com serves a stripped logged-out shell (no ondemand.s bundle
+    reference) to unauthenticated requests, which crashes
+    x_client_transaction's homepage parsing. The homepage fetch used to
+    init ClientTransaction must carry the session's auth cookies so x.com
+    returns the full authenticated app shell instead.
+    """
+
+    @patch("twitter_cli.client.TwitterClient._load_ct_cache", return_value=False)
+    @patch("twitter_cli.client._get_cffi_session")
+    @patch("twitter_cli.client._gen_ct_headers", return_value={})
+    def test_homepage_fetch_includes_auth_cookie(self, mock_ct_headers, mock_session, mock_load_cache):
+        mock_session.return_value = MagicMock()
+        # Fail fast right after the homepage fetch so we don't need to mock
+        # the rest of the ClientTransaction init chain.
+        mock_session.return_value.get = MagicMock(side_effect=Exception("stop after homepage fetch"))
+
+        client = TwitterClient.__new__(TwitterClient)
+        client._auth_token = "test_token"
+        client._ct0 = "test_ct0"
+        client._cookie_string = None
+        client._client_transaction = None
+        client._ct_init_attempted = False
+
+        client._ensure_client_transaction()
+
+        homepage_call = mock_session.return_value.get.call_args
+        assert homepage_call.args[0] == "https://x.com"
+        sent_headers = homepage_call.kwargs["headers"]
+        assert sent_headers["Cookie"] == "auth_token=test_token; ct0=test_ct0"
+
+    @patch("twitter_cli.client.TwitterClient._load_ct_cache", return_value=False)
+    @patch("twitter_cli.client._get_cffi_session")
+    @patch("twitter_cli.client._gen_ct_headers", return_value={})
+    def test_homepage_fetch_prefers_full_cookie_string(self, mock_ct_headers, mock_session, mock_load_cache):
+        mock_session.return_value = MagicMock()
+        mock_session.return_value.get = MagicMock(side_effect=Exception("stop after homepage fetch"))
+
+        client = TwitterClient.__new__(TwitterClient)
+        client._auth_token = "test_token"
+        client._ct0 = "test_ct0"
+        client._cookie_string = "auth_token=x; ct0=y; other=z"
+        client._client_transaction = None
+        client._ct_init_attempted = False
+
+        client._ensure_client_transaction()
+
+        sent_headers = mock_session.return_value.get.call_args.kwargs["headers"]
+        assert sent_headers["Cookie"] == "auth_token=x; ct0=y; other=z"
+
+
 class TestPaginationBehavior:
     def test_fetch_timeline_can_include_promoted_content(self):
         client = TwitterClient.__new__(TwitterClient)
