@@ -107,6 +107,7 @@ def test_extract_in_process_supports_arc(monkeypatch) -> None:
         edge=lambda: pytest.fail("edge should not be used when arc succeeds"),
         firefox=lambda: pytest.fail("firefox should not be used when arc succeeds"),
         brave=lambda: pytest.fail("brave should not be used when arc succeeds"),
+        vivaldi=lambda cookie_file=None: pytest.fail("vivaldi should not be used when arc succeeds"),
     )
     monkeypatch.setitem(sys.modules, "browser_cookie3", fake_module)
 
@@ -136,6 +137,7 @@ def test_extract_via_subprocess_script_includes_arc(monkeypatch) -> None:
 
     assert cookies is None
     assert '"arc": browser_cookie3.arc' in seen["script"]
+    assert '"vivaldi": browser_cookie3.vivaldi' in seen["script"]
 
 
 def test_extract_via_subprocess_retries_uv_when_current_env_has_no_output(monkeypatch) -> None:
@@ -312,6 +314,7 @@ def test_extract_in_process_tries_multiple_profiles(monkeypatch, tmp_path) -> No
         edge=lambda cookie_file=None: [],
         firefox=lambda: [],
         brave=lambda cookie_file=None: [],
+        vivaldi=lambda cookie_file=None: [],
     )
     monkeypatch.setitem(sys.modules, "browser_cookie3", fake_module)
 
@@ -405,6 +408,7 @@ def test_extract_in_process_returns_diagnostics_on_failure(monkeypatch) -> None:
         edge=lambda: (_ for _ in ()).throw(BrowserError("Edge not found")),
         firefox=lambda: (_ for _ in ()).throw(BrowserError("Firefox not found")),
         brave=lambda: (_ for _ in ()).throw(BrowserError("Brave not found")),
+        vivaldi=lambda cookie_file=None: (_ for _ in ()).throw(BrowserError("Vivaldi not found")),
     )
     monkeypatch.setitem(sys.modules, "browser_cookie3", fake_module)
 
@@ -412,3 +416,52 @@ def test_extract_in_process_returns_diagnostics_on_failure(monkeypatch) -> None:
 
     assert cookies is None
     assert any("cookie decryption" in d for d in diagnostics)
+
+
+def test_get_browser_order_accepts_vivaldi(monkeypatch) -> None:
+    monkeypatch.setenv("TWITTER_BROWSER", "vivaldi")
+
+    order = auth._get_browser_order()
+
+    assert order[0] == "vivaldi"
+    assert set(order) == {"arc", "chrome", "edge", "firefox", "brave", "vivaldi"}
+
+
+def test_extract_in_process_supports_vivaldi(monkeypatch) -> None:
+    class Cookie:
+        def __init__(self, domain: str, name: str, value: str) -> None:
+            self.domain = domain
+            self.name = name
+            self.value = value
+
+    monkeypatch.setenv("TWITTER_BROWSER", "vivaldi")
+    fake_module = SimpleNamespace(
+        arc=lambda cookie_file=None: [],
+        chrome=lambda cookie_file=None: [],
+        edge=lambda cookie_file=None: [],
+        firefox=lambda: [],
+        brave=lambda cookie_file=None: [],
+        vivaldi=lambda cookie_file=None: [Cookie(".x.com", "auth_token", "token"), Cookie(".x.com", "ct0", "csrf")],
+    )
+    monkeypatch.setitem(sys.modules, "browser_cookie3", fake_module)
+
+    cookies, diagnostics = auth._extract_in_process()
+
+    assert cookies is not None
+    assert cookies["auth_token"] == "token"
+    assert cookies["ct0"] == "csrf"
+
+
+def test_iter_chrome_cookie_files_vivaldi_linux(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(auth.sys, "platform", "linux")
+    vivaldi_dir = tmp_path / ".config" / "vivaldi"
+    (vivaldi_dir / "Default").mkdir(parents=True)
+    (vivaldi_dir / "Default" / "Cookies").touch()
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("TWITTER_CHROME_PROFILE", raising=False)
+
+    paths = auth._iter_chrome_cookie_files("vivaldi")
+
+    assert len(paths) == 1
+    assert paths[0].endswith(".config/vivaldi/Default/Cookies")

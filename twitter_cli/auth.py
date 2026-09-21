@@ -201,10 +201,11 @@ _CHROMIUM_BASE_DIRS: Dict[str, str] = {
     "arc": os.path.join("Arc", "User Data"),
     "edge": "Microsoft Edge",
     "brave": os.path.join("BraveSoftware", "Brave-Browser"),
+    "vivaldi": "Vivaldi",
 }
 
 # Default browser order for cookie extraction
-_DEFAULT_BROWSER_ORDER = ["arc", "chrome", "edge", "firefox", "brave"]
+_DEFAULT_BROWSER_ORDER = ["arc", "chrome", "edge", "firefox", "brave", "vivaldi"]
 
 
 def _get_browser_order() -> List[str]:
@@ -212,7 +213,7 @@ def _get_browser_order() -> List[str]:
     env = os.environ.get("TWITTER_BROWSER", "").strip().lower()
     if not env:
         return _DEFAULT_BROWSER_ORDER
-    if env not in {"arc", "chrome", "edge", "firefox", "brave"}:
+    if env not in {"arc", "chrome", "edge", "firefox", "brave", "vivaldi"}:
         logger.warning("TWITTER_BROWSER='%s' is invalid, using default order", env)
         return _DEFAULT_BROWSER_ORDER
     return [env] + [b for b in _DEFAULT_BROWSER_ORDER if b != env]
@@ -233,11 +234,15 @@ def _iter_chrome_cookie_files(browser_name: str) -> List[str]:
     elif sys.platform == "win32":
         if browser_name == "edge":
             root = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Edge", "User Data")
+        elif browser_name == "vivaldi":
+            root = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Vivaldi", "User Data")
         else:
             root = os.path.join(os.environ.get("LOCALAPPDATA", ""), base_dir)
     else:
         if browser_name == "edge":
             root = os.path.join(os.path.expanduser("~"), ".config", "microsoft-edge")
+        elif browser_name == "vivaldi":
+            root = os.path.join(os.path.expanduser("~"), ".config", "vivaldi")
         else:
             root = os.path.join(os.path.expanduser("~"), ".config", base_dir)
 
@@ -292,6 +297,7 @@ def _extract_in_process() -> Tuple[Optional[Dict[str, str]], List[str]]:
         "edge": browser_cookie3.edge,
         "firefox": browser_cookie3.firefox,
         "brave": browser_cookie3.brave,
+        "vivaldi": browser_cookie3.vivaldi,
     }
     attempts: List[str] = []
     diagnostics: List[str] = []
@@ -369,6 +375,7 @@ CHROMIUM_BASE_DIRS = {
     "arc": os.path.join("Arc", "User Data"),
     "edge": os.path.join("Microsoft Edge"),
     "brave": os.path.join("BraveSoftware", "Brave-Browser"),
+    "vivaldi": "Vivaldi",
 }
 
 def iter_cookie_files(browser_name):
@@ -380,11 +387,15 @@ def iter_cookie_files(browser_name):
     elif sys.platform == "win32":
         if browser_name == "edge":
             root = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Edge", "User Data")
+        elif browser_name == "vivaldi":
+            root = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Vivaldi", "User Data")
         else:
             root = os.path.join(os.environ.get("LOCALAPPDATA", ""), base_dir)
     else:
         if browser_name == "edge":
             root = os.path.join(os.path.expanduser("~"), ".config", "microsoft-edge")
+        elif browser_name == "vivaldi":
+            root = os.path.join(os.path.expanduser("~"), ".config", "vivaldi")
         else:
             root = os.path.join(os.path.expanduser("~"), ".config", base_dir)
     if not os.path.isdir(root):
@@ -423,9 +434,9 @@ def extract_from_jar(jar, name, profile=""):
         return result
     return None
 
-DEFAULT_ORDER = ["arc", "chrome", "edge", "firefox", "brave"]
+DEFAULT_ORDER = ["arc", "chrome", "edge", "firefox", "brave", "vivaldi"]
 env_browser = os.environ.get("TWITTER_BROWSER", "").strip().lower()
-if env_browser in {"arc", "chrome", "edge", "firefox", "brave"}:
+if env_browser in {"arc", "chrome", "edge", "firefox", "brave", "vivaldi"}:
     browser_order = [env_browser] + [b for b in DEFAULT_ORDER if b != env_browser]
 else:
     browser_order = DEFAULT_ORDER
@@ -435,6 +446,7 @@ browser_fns = {
     "edge": browser_cookie3.edge,
     "firefox": browser_cookie3.firefox,
     "brave": browser_cookie3.brave,
+    "vivaldi": browser_cookie3.vivaldi,
 }
 attempts = []
 
@@ -614,7 +626,7 @@ def get_cookies() -> Dict[str, str]:
             lines.extend("  " + line for line in hint.splitlines())
             lines.append("")
         lines.append("Option 1: Set TWITTER_AUTH_TOKEN and TWITTER_CT0 environment variables")
-        lines.append("Option 2: Make sure you are logged into x.com in your browser (Arc/Chrome/Edge/Firefox/Brave)")
+        lines.append("Option 2: Make sure you are logged into x.com in your browser (Arc/Chrome/Edge/Firefox/Brave/Vivaldi)")
         lines.append("")
         lines.append("Run 'twitter -v <command>' for debug diagnostics.")
         raise AuthenticationError("\n".join(lines))
