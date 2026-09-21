@@ -265,6 +265,46 @@ class TestUpdateFeaturesFromHtml:
 
 # ── TwitterClient._build_headers ─────────────────────────────────────────
 
+# ClientTransaction initialization regression
+class TestClientTransactionInitialization:
+    @patch("twitter_cli.client._update_features_from_html")
+    @patch("twitter_cli.client.ClientTransaction")
+    @patch("twitter_cli.client._gen_ct_headers", return_value={"User-Agent": "test"})
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_fetches_home_route_for_ondemand_bundle(
+        self,
+        mock_session,
+        mock_headers,
+        mock_transaction,
+        mock_update_features,
+    ):
+        home_html = (
+            '<script>window.__MODULES__={0:"unused",59924:"ondemand.s"};'
+            'window.__HASHES__={0:"unused",59924:"0cc29d94ce9e97ee"}</script>'
+        )
+        home_page = MagicMock(content=home_html.encode(), text=home_html)
+        ondemand_file = MagicMock(text="ondemand bundle")
+        mock_session.return_value.get.side_effect = [home_page, ondemand_file]
+
+        client = TwitterClient.__new__(TwitterClient)
+        client._client_transaction = None
+        client._ct_init_attempted = False
+        client._load_ct_cache = MagicMock(return_value=False)
+        client._save_ct_cache = MagicMock()
+
+        client._ensure_client_transaction()
+
+        first_request = mock_session.return_value.get.call_args_list[0]
+        second_request = mock_session.return_value.get.call_args_list[1]
+        assert first_request.args[0] == "https://x.com/home"
+        assert second_request.args[0] == (
+            "https://abs.twimg.com/responsive-web/client-web/"
+            "ondemand.s.0cc29d94ce9e97eea.js"
+        )
+        assert client._client_transaction is mock_transaction.return_value
+
+
+# Header construction tests
 class TestBuildHeaders:
     @patch("twitter_cli.client._get_cffi_session")
     @patch("twitter_cli.client._gen_ct_headers", return_value={})
