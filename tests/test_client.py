@@ -7,6 +7,7 @@ and feature flag update logic — all without requiring network access.
 from __future__ import annotations
 
 import copy
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -265,6 +266,46 @@ class TestUpdateFeaturesFromHtml:
 
 # ── TwitterClient._build_headers ─────────────────────────────────────────
 
+# ClientTransaction initialization regression
+class TestClientTransactionInitialization:
+    @patch("twitter_cli.client._update_features_from_html")
+    @patch("twitter_cli.client.ClientTransaction")
+    @patch("twitter_cli.client._gen_ct_headers", return_value={"User-Agent": "test"})
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_fetches_home_route_for_ondemand_bundle(
+        self,
+        mock_session,
+        mock_headers,
+        mock_transaction,
+        mock_update_features,
+    ):
+        home_html = (
+            '<script>window.__MODULES__={0:"unused",59924:"ondemand.s"};'
+            'window.__HASHES__={0:"unused",59924:"0cc29d94ce9e97ee"}</script>'
+        )
+        home_page = MagicMock(content=home_html.encode(), text=home_html)
+        ondemand_file = MagicMock(text="ondemand bundle")
+        mock_session.return_value.get.side_effect = [home_page, ondemand_file]
+
+        client = TwitterClient.__new__(TwitterClient)
+        client._client_transaction = None
+        client._ct_init_attempted = False
+        client._load_ct_cache = MagicMock(return_value=False)
+        client._save_ct_cache = MagicMock()
+
+        client._ensure_client_transaction()
+
+        first_request = mock_session.return_value.get.call_args_list[0]
+        second_request = mock_session.return_value.get.call_args_list[1]
+        assert first_request.args[0] == "https://x.com/home"
+        assert second_request.args[0] == (
+            "https://abs.twimg.com/responsive-web/client-web/"
+            "ondemand.s.0cc29d94ce9e97eea.js"
+        )
+        assert client._client_transaction is mock_transaction.return_value
+
+
+# Header construction tests
 class TestBuildHeaders:
     @patch("twitter_cli.client._get_cffi_session")
     @patch("twitter_cli.client._gen_ct_headers", return_value={})
@@ -1235,6 +1276,17 @@ class TestTwitterAPIError:
         err = TwitterAPIError(500, "Server error")
         assert isinstance(err, RuntimeError)
 
+    def test_preserves_upstream_diagnostics_without_changing_message(self):
+        err = TwitterAPIError(
+            0,
+            "Failed to create tweet",
+            upstream_status_code=200,
+            upstream_response='{"errors":[{"message":"Rejected"}]}',
+        )
+        assert str(err) == "Twitter API error (HTTP 0): Failed to create tweet"
+        assert err.upstream_status_code == 200
+        assert err.upstream_response == '{"errors":[{"message":"Rejected"}]}'
+
 
 class TestParseUserResult:
     def test_coerces_count_fields_to_int(self):
@@ -1480,6 +1532,49 @@ class TestCreateTweetWithMedia:
         result = client.create_tweet("no media")
         assert result == "88"
         assert captured_body["media"]["media_entities"] == []
+
+    def test_create_tweet_without_id_preserves_full_response(self):
+        client = TwitterClient.__new__(TwitterClient)
+        client._request_delay = 0
+        response = {"data": {"create_tweet": {"tweet_results": {"result": {}}}}, "extra": [1, 2]}
+        client._graphql_post = lambda *args: response
+
+        with pytest.raises(TwitterAPIError, match="response missing tweet ID") as caught:
+            client.create_tweet("test", reply_to_id="123")
+
+        assert caught.value.upstream_status_code is None
+        assert json.loads(caught.value.upstream_response) == response
+
+
+class TestApiRequestDiagnostics:
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_http_error_preserves_full_body(self, mock_session):
+        response = MagicMock(status_code=403, text="x" * 600)
+        mock_session.return_value.get.return_value = response
+        client = TwitterClient.__new__(TwitterClient)
+        client._max_retries = 0
+        client._build_headers = lambda **kwargs: {}
+
+        with pytest.raises(TwitterAPIError) as caught:
+            client._api_request("https://x.com/test")
+
+        assert caught.value.upstream_status_code == 403
+        assert caught.value.upstream_response == "x" * 600
+        assert "x" * 501 not in str(caught.value)
+
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_graphql_error_preserves_full_body_and_actual_http_status(self, mock_session):
+        body = '{"data":{"create_tweet":{"errors":[{"message":"Rejected","code":321}]}}}'
+        mock_session.return_value.post.return_value = MagicMock(status_code=200, text=body)
+        client = TwitterClient.__new__(TwitterClient)
+        client._max_retries = 0
+        client._build_headers = lambda **kwargs: {}
+
+        with pytest.raises(TwitterAPIError) as caught:
+            client._api_request("https://x.com/test", method="POST", body={})
+
+        assert caught.value.upstream_status_code == 200
+        assert caught.value.upstream_response == body
 
 
 # ── fetch_search uses POST ────────────────────────────────────────────────

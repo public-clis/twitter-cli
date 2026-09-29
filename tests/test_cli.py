@@ -9,6 +9,7 @@ from rich.console import Console
 import yaml
 
 from twitter_cli.cli import cli
+from twitter_cli.exceptions import TwitterAPIError
 from twitter_cli.formatter import article_to_markdown, print_tweet_table
 from twitter_cli.models import Author, BookmarkFolder, Metrics, Tweet, UserProfile
 from twitter_cli.serialization import tweets_to_json
@@ -540,6 +541,44 @@ def test_cli_reply_command(monkeypatch) -> None:
     assert result.exit_code == 0
     assert calls[0]["reply_to_id"] == "12345"
     assert calls[0]["text"] == "Nice tweet!"
+
+
+def test_cli_reply_failure_includes_upstream_response_only_in_structured_details(monkeypatch) -> None:
+    response_body = '{"data":{"create_tweet":{"errors":[{"message":"Rejected"}]}}}'
+
+    class FakeClient:
+        def create_tweet(self, text: str, reply_to_id=None, media_ids=None) -> str:
+            raise TwitterAPIError(
+                0,
+                "Twitter API: Rejected",
+                upstream_status_code=200,
+                upstream_response=response_body,
+            )
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    result = CliRunner().invoke(cli, ["reply", "12345", "Nice tweet!", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["error"]["details"] == {
+        "action": "reply",
+        "replyTo": "12345",
+        "upstream": {"httpStatus": 200, "responseBody": response_body},
+    }
+    assert response_body not in payload["error"]["message"]
+
+
+def test_cli_post_failure_does_not_include_upstream_response(monkeypatch) -> None:
+    class FakeClient:
+        def create_tweet(self, text: str, reply_to_id=None, media_ids=None) -> str:
+            raise TwitterAPIError(0, "Rejected", upstream_response="private response")
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    result = CliRunner().invoke(cli, ["post", "hello", "--json"])
+
+    assert result.exit_code == 1
+    assert "upstream" not in json.loads(result.output)["error"]["details"]
+    assert "private response" not in result.output
 
 
 def test_cli_quote_command(monkeypatch) -> None:

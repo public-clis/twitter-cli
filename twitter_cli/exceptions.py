@@ -63,9 +63,18 @@ class InvalidInputError(TwitterError):
 class TwitterAPIError(TwitterError):
     """Raised on non-OK Twitter API responses with HTTP status + message."""
 
-    def __init__(self, status_code: int, message: str):
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        upstream_status_code: int | None = None,
+        upstream_response: str | None = None,
+    ):
         self.status_code = status_code
         self.message = message
+        self.upstream_status_code = upstream_status_code
+        self.upstream_response = upstream_response
         # Derive error_code from HTTP status
         if status_code in (401, 403):
             self.error_code = "not_authenticated"

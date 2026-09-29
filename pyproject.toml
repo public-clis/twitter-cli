@@ -25,7 +25,7 @@ dependencies = [
     "rich>=13.0",
     "PyYAML>=6.0",
     "curl_cffi>=0.7",
-    "xclienttransaction>=1.0.1",
+    "xclienttransaction>=1.0.3",
     "beautifulsoup4>=4.12",
 ]
 
