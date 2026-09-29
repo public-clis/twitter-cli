@@ -1103,8 +1103,20 @@ class TwitterClient:
             # a different TLS fingerprint on the same IP — a detection vector.
             cffi_session = _get_cffi_session()
             ct_headers = _gen_ct_headers()
+            # The root path serves a lightweight logged-out shell without the
+            # ondemand.s bundle. The responsive /home route exposes it, but
+            # only when a session cookie is sent (verified 2026-09-29:
+            # /home without a cookie is a 17KB stripped shell, with a cookie
+            # it is a 305KB page containing the module + hash maps).
+            # The generated transaction id is derived from public page data,
+            # so sending the cookie here does not weaken it — it is only the
+            # difference between a header that works and a 404 on every
+            # header-gated GET (SearchTimeline, Followers, Following, Likes).
+            ct_headers["Cookie"] = self._cookie_string or (
+                "auth_token=%s; ct0=%s" % (self._auth_token, self._ct0)
+            )
             home_page = cffi_session.get(
-                "https://x.com", headers=ct_headers, timeout=10,
+                "https://x.com/home", headers=ct_headers, timeout=10,
             )
             home_page_response = bs4.BeautifulSoup(home_page.content, "html.parser")
             ondemand_url = get_ondemand_file_url(response=home_page_response)

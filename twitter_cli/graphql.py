@@ -120,13 +120,35 @@ def _scan_bundles(url_fetch_fn):
     try:
         from .constants import get_user_agent
         html = url_fetch_fn("https://x.com", {"user-agent": get_user_agent()})
+        # Match both the legacy responsive-web/client-web layout and the new
+        # x-web/x-web layout (X moved the web build to /x-web/ in 2026).
         script_pattern = re.compile(
             r'(?:src|href)=["\']'
-            r'(https://abs\.twimg\.com/responsive-web/client-web[^"\']+'
+            r'(https://abs\.twimg\.com/(?:responsive-web/client-web|x-web/x-web)[^"\']+'
             r'\.js)'
             r'["\']'
         )
         script_urls = script_pattern.findall(html)
+        # The x-web entry bundle references its code as relative ./assets/*.js
+        # chunks — follow those so any queryId/operationName pairs stay
+        # reachable as the build layout evolves.
+        if script_urls:
+            try:
+                from curl_cffi import requests as _cc_requests
+
+                _sess: Any = _cc_requests.Session(impersonate="chrome")
+                for script_url in list(script_urls):
+                    if "/x-web/x-web/" not in script_url:
+                        continue
+                    entry = _sess.get(script_url, timeout=20).text
+                    for rel in re.findall(
+                        r'["\']\./assets/([a-zA-Z0-9._\-]+\.js)["\']', entry
+                    ):
+                        full = script_url.rsplit("/", 1)[0] + "/" + rel
+                        if full not in script_urls:
+                            script_urls.append(full)
+            except Exception as _exc:
+                logger.debug("x-web asset follow-up scan failed: %s", _exc)
     except Exception as exc:  # pragma: no cover - network-dependent branch
         logger.warning("Failed to scan JS bundles: %s", exc)
         return

@@ -170,7 +170,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -641,7 +641,7 @@ requires-dist = [
     { name = "rich", specifier = ">=13.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0.12" },
-    { name = "xclienttransaction", specifier = ">=1.0.1" },
+    { name = "xclienttransaction", specifier = ">=1.0.3" },
 ]
 provides-extras = ["dev"]
 
@@ -677,12 +677,12 @@ wheels = [
 
 [[package]]
 name = "xclienttransaction"
-version = "1.0.1"
+version = "1.0.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/eb/c7/c841afe6759567cf29e36196dff65c935682b69ae38e986bd14e7decf74e/xclienttransaction-1.0.1.tar.gz", hash = "sha256:e4e032ff27e76ab927c0a7f57ad3630e06b7100c113bdf22b03cdde9584756f3", size = 9062, upload-time = "2025-10-09T10:38:31.485Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1b/11/6f5a55df6d464fe6f839fe96c3863fa2338005ed8e83e89b0a9db5716b5a/xclienttransaction-1.0.3.tar.gz", hash = "sha256:1eeb5d48cec6a224189bbd8a6021c40486fa3aff650478672bccf82b3436cedc", size = 10609, upload-time = "2026-06-26T10:47:39.664Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fe/b8/b953828e2f0f658f7f2d6354525728c9569c83937ebe4903f2391f02a702/xclienttransaction-1.0.1-py3-none-any.whl", hash = "sha256:0280e021129a38f8ee2ebede6406d4c065a599430bd4c8aa0c122f2e42f9f0f0", size = 10724, upload-time = "2025-10-09T10:38:30.098Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/a1/be735112ebe49916065e6f80017b93e92fc8880789c3f4f17380db7f531a/xclienttransaction-1.0.3-py3-none-any.whl", hash = "sha256:f73dd2a4b6856f98fa45f0cd26c9a0fdc0b2ceba0e79b5523cdf8aac7efc59fe", size = 10778, upload-time = "2026-06-26T10:47:38.401Z" },
 ]

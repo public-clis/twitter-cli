@@ -1545,3 +1545,140 @@ class TestFetchSearchUsesPost:
 
         assert captured.get("product") == "Latest"
         assert captured.get("querySource") == "typed_query"
+
+
+# ── ClientTransaction bootstrap (x-client-transaction-id) ───────────────
+
+# Synthetic x.com/home page in the layout X ships since Sept 2026:
+#  - webpack numeric module map ("59924:\"ondemand.s\"")
+#  - separate numeric index -> hash map
+#  - twitter-site-verification meta + loading-x-anim frames
+# The key is a valid base64 blob (16 bytes) so get_key_bytes() can decode it.
+_CT_HOME_HTML = (
+    '<html><head>'
+    '<meta name="twitter-site-verification" content="MTIzNDU2Nzg5MGFiY2RlZmI="/>'
+    '</head><body>'
+    '<script>window.__M={0:"unused",59924:"ondemand.s",60041:"i18n"}</script>'
+    '<script>window.__H={0:"0000000000000000",59924:"38289b77fa31a72c",60041:"deadbeef12345678"}</script>'
+    '<svg id="loading-x-anim-0"><g><path d="M0 0 C 10 20, 30 40, 50 60 70 80, 90 100, 110 120"/></g></svg>'
+    '<svg id="loading-x-anim-1"><g><path d="M0 0 C 5 10, 15 25, 25 35 45 45, 55 55, 65 65"/></g></svg>'
+    '<svg id="loading-x-anim-2"><g><path d="M1 1 C 2 2, 3 3, 4 4 5 5, 6 6, 7 7"/></g></svg>'
+    '<svg id="loading-x-anim-3"><g><path d="M2 2 C 3 3, 4 4, 5 5 6 6, 7 7, 8 8"/></g></svg>'
+    '</body></html>'
+)
+
+# The current ondemand.s bundle content shape (fetched 2026-09-29). The
+# INDICES pattern the library extracts from it is embedded here so the test
+# runs without a network call. Note the required space after each comma —
+# the INDICES_REGEX is `(x[<1-2 digits>], 16)`-shaped. The real bundle yields
+# >=2 matches (row index + frame-time bytes), so this fixture does too.
+_CT_ONDEMAND_JS = (
+    "var a=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,"
+    "26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45];"
+    "var b=function(c){return(a[(c[0], 16)],(a[(c[1], 17)]),(a[(c[2], 18)]),"
+    "(a[(c[3], 19)]),(a[(c[4], 20)]));};var d=b(a);"
+)
+
+
+class TestClientTransactionBootstrap:
+    """Regression: CT must bootstrap from /home (with the session cookie),
+    not from the stripped root page, and must send the cookie on the
+    bootstrap request."""
+
+    def _make_client(self, cookie_string=None):
+        client = TwitterClient.__new__(TwitterClient)
+        client._auth_token = "auth_tok"
+        client._ct0 = "ct0_val"
+        client._cookie_string = cookie_string
+        client._client_transaction = None
+        client._ct_init_attempted = False
+        client._load_ct_cache = MagicMock(return_value=False)
+        client._save_ct_cache = MagicMock()
+        return client
+
+    @patch("twitter_cli.client._update_features_from_html")
+    @patch("twitter_cli.client.ClientTransaction")
+    @patch("twitter_cli.client._gen_ct_headers", return_value={"Referer": "https://x.com"})
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_bootstraps_from_home_with_cookie(
+        self, mock_session, mock_ct_headers, mock_tx, mock_features
+    ):
+        """First request must be x.com/home carrying the session cookie, and
+        the second must be the resolved ondemand.s bundle URL."""
+        import bs4
+
+        home_page = MagicMock(
+            content=_CT_HOME_HTML.encode("utf-8"), text=_CT_HOME_HTML
+        )
+        ondemand_page = MagicMock(text=_CT_ONDEMAND_JS)
+
+        mock_session.return_value.get.side_effect = [home_page, ondemand_page]
+
+        client = self._make_client(cookie_string="auth_token=auth_tok; ct0=ct0_val")
+        client._ensure_client_transaction()
+
+        first = mock_session.return_value.get.call_args_list[0]
+        second = mock_session.return_value.get.call_args_list[1]
+        # 1. The bootstrap hit the responsive /home route, not the root shell.
+        assert first.args[0] == "https://x.com/home"
+        # 2. The session cookie was sent on the bootstrap request.
+        headers = first.kwargs.get("headers", {})
+        assert headers.get("Cookie") == "auth_token=auth_tok; ct0=ct0_val"
+        # 3. The ondemand bundle URL was resolved from the /home page
+        #    (only possible because the module + hash maps are present).
+        assert second.args[0] == (
+            "https://abs.twimg.com/responsive-web/client-web/"
+            "ondemand.s.38289b77fa31a72ca.js"
+        )
+        # 4. The ClientTransaction object was constructed from the /home page.
+        mock_tx.assert_called_once()
+        constructed_page = mock_tx.call_args.kwargs["home_page_response"]
+        assert isinstance(constructed_page, bs4.BeautifulSoup)
+
+    @patch("twitter_cli.client._update_features_from_html")
+    @patch("twitter_cli.client.ClientTransaction")
+    @patch("twitter_cli.client._gen_ct_headers", return_value={"Referer": "https://x.com"})
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_falls_back_to_auth_token_cookie(
+        self, mock_session, mock_ct_headers, mock_tx, mock_features
+    ):
+        """When no full browser cookie string exists, the bootstrap still
+        sends auth_token+ct0 so the /home page is not stripped."""
+        home_page = MagicMock(
+            content=_CT_HOME_HTML.encode("utf-8"), text=_CT_HOME_HTML
+        )
+        home_page.content = _CT_HOME_HTML.encode("utf-8")
+        ondemand_page = MagicMock(text=_CT_ONDEMAND_JS)
+        mock_session.return_value.get.side_effect = [home_page, ondemand_page]
+
+        client = self._make_client(cookie_string=None)
+        client._ensure_client_transaction()
+
+        headers = mock_session.return_value.get.call_args_list[0].kwargs.get("headers", {})
+        assert headers.get("Cookie") == "auth_token=auth_tok; ct0=ct0_val"
+
+    @patch("twitter_cli.client._update_features_from_html")
+    @patch("twitter_cli.client.ClientTransaction")
+    @patch("twitter_cli.client._gen_ct_headers", return_value={"Referer": "https://x.com"})
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_real_parser_resolves_ondemand_from_current_layout(
+        self, mock_session, mock_ct_headers, mock_tx, mock_features
+    ):
+        """The real (unmocked) x_client_transaction parser must resolve the
+        ondemand.s URL from a page in the current numeric-module layout.
+
+        This is the exact call that raised AttributeError under the pinned
+        xclienttransaction 1.0.1 (its regex expects the old
+        '"ondemand.s": "<hash>"' name->hash map, not the numeric index
+        layout X ships since Sept 2026). The floor bump in pyproject.toml
+        (>=1.0.3) is what makes this pass.
+        """
+        from x_client_transaction.utils import get_ondemand_file_url
+        import bs4
+
+        soup = bs4.BeautifulSoup(_CT_HOME_HTML, "html.parser")
+        url = get_ondemand_file_url(response=soup)
+        assert url == (
+            "https://abs.twimg.com/responsive-web/client-web/"
+            "ondemand.s.38289b77fa31a72ca.js"
+        )
