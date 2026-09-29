@@ -48,7 +48,7 @@ import yaml
 from . import __version__
 from .auth import get_cookies
 from .cache import resolve_cached_tweet, save_tweet_cache
-from .exceptions import TwitterError
+from .exceptions import TwitterAPIError, TwitterError
 from .client import TwitterClient
 from .config import load_config
 from .filter import filter_tweets
@@ -274,6 +274,7 @@ def _run_write_command(
     progress_lines: Optional[List[str]] = None,
     success_lines: Optional[List[str]] = None,
     error_details: Optional[Dict[str, Any]] = None,
+    include_upstream_response: bool = False,
 ) -> Optional[WritePayload]:
     mode = _structured_mode(as_json=as_json, as_yaml=as_yaml)
     try:
@@ -281,7 +282,16 @@ def _run_write_command(
         _print_lines(progress_lines or [], mode)
         payload = operation(client)
     except (TwitterError, RuntimeError) as exc:
-        _handle_structured_runtime_error(exc, mode=mode, details=error_details)
+        details = error_details
+        if include_upstream_response and isinstance(exc, TwitterAPIError):
+            details = {
+                **(error_details or {}),
+                "upstream": {
+                    "httpStatus": exc.upstream_status_code,
+                    "responseBody": exc.upstream_response,
+                },
+            }
+        _handle_structured_runtime_error(exc, mode=mode, details=details)
         return None
 
     if _emit_mode_payload(payload, mode):
@@ -1223,6 +1233,7 @@ def reply_tweet(tweet_id, text, images, as_json, as_yaml):
         progress_lines=["💬 Replying to %s..." % tweet_id],
         success_lines=["[green]✅ Reply posted![/green]"],
         error_details={"action": "reply", "replyTo": tweet_id},
+        include_upstream_response=True,
     )
     if payload and not _structured_mode(as_json=as_json, as_yaml=as_yaml):
         console.print("🔗 %s" % payload["url"])

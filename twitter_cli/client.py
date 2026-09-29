@@ -585,9 +585,14 @@ class TwitterClient:
         data = self._graphql_post("CreateTweet", variables, FEATURES)
         self._write_delay()
         result = _deep_get(data, "data", "create_tweet", "tweet_results", "result")
-        if result:
-            return result.get("rest_id", "")
-        raise TwitterAPIError(0, "Failed to create tweet")
+        tweet_id = result.get("rest_id") if isinstance(result, dict) else None
+        if isinstance(tweet_id, str) and tweet_id:
+            return tweet_id
+        raise TwitterAPIError(
+            0,
+            "Failed to create tweet: response missing tweet ID",
+            upstream_response=json.dumps(data, ensure_ascii=False),
+        )
 
     def delete_tweet(self, tweet_id):
         # type: (str) -> bool
@@ -976,8 +981,14 @@ class TwitterClient:
                     time.sleep(wait)
                     continue
                 if status_code >= 400:
-                    message = "Twitter API error %d: %s" % (status_code, response.text[:500])
-                    raise TwitterAPIError(status_code, message)
+                    response_text = response.text
+                    message = "Twitter API error %d: %s" % (status_code, response_text[:500])
+                    raise TwitterAPIError(
+                        status_code,
+                        message,
+                        upstream_status_code=status_code,
+                        upstream_response=response_text,
+                    )
 
                 payload = response.text
             except TwitterAPIError:
@@ -988,7 +999,12 @@ class TwitterClient:
             try:
                 parsed = json.loads(payload)
             except (json.JSONDecodeError, ValueError):
-                raise TwitterAPIError(0, "Twitter API returned invalid JSON")
+                raise TwitterAPIError(
+                    0,
+                    "Twitter API returned invalid JSON",
+                    upstream_status_code=status_code,
+                    upstream_response=payload,
+                )
 
             if isinstance(parsed, dict) and parsed.get("errors"):
                 err_msg = parsed["errors"][0].get("message", "Unknown error")
@@ -1007,9 +1023,17 @@ class TwitterClient:
                 # Provide user-friendly message
                 if err_code in (348, 349):
                     raise TwitterAPIError(
-                        429, "Rate limited: %s (try again later, recommended wait: 15+ minutes)" % err_msg
+                        429,
+                        "Rate limited: %s (try again later, recommended wait: 15+ minutes)" % err_msg,
+                        upstream_status_code=status_code,
+                        upstream_response=payload,
                     )
-                raise TwitterAPIError(0, "Twitter API returned errors: %s" % err_msg)
+                raise TwitterAPIError(
+                    0,
+                    "Twitter API returned errors: %s" % err_msg,
+                    upstream_status_code=status_code,
+                    upstream_response=payload,
+                )
 
             # GraphQL write mutations return errors in data.errors (separate from top-level)
             if isinstance(parsed, dict) and "data" in parsed:
@@ -1020,7 +1044,12 @@ class TwitterClient:
                             inner_errors = val["errors"]
                             if inner_errors:
                                 inner_msg = inner_errors[0].get("message", "Unknown error")
-                                raise TwitterAPIError(0, "Twitter API: %s" % inner_msg)
+                                raise TwitterAPIError(
+                                    0,
+                                    "Twitter API: %s" % inner_msg,
+                                    upstream_status_code=status_code,
+                                    upstream_response=payload,
+                                )
 
             return parsed
 
