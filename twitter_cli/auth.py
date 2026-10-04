@@ -10,6 +10,7 @@ Supports:
 
 from __future__ import annotations
 
+import configparser
 import glob
 import json
 import logging
@@ -204,7 +205,7 @@ _CHROMIUM_BASE_DIRS: Dict[str, str] = {
 }
 
 # Default browser order for cookie extraction
-_DEFAULT_BROWSER_ORDER = ["arc", "chrome", "edge", "firefox", "brave"]
+_DEFAULT_BROWSER_ORDER = ["arc", "chrome", "edge", "firefox", "brave", "zen"]
 
 
 def _get_browser_order() -> List[str]:
@@ -212,7 +213,7 @@ def _get_browser_order() -> List[str]:
     env = os.environ.get("TWITTER_BROWSER", "").strip().lower()
     if not env:
         return _DEFAULT_BROWSER_ORDER
-    if env not in {"arc", "chrome", "edge", "firefox", "brave"}:
+    if env not in _DEFAULT_BROWSER_ORDER:
         logger.warning("TWITTER_BROWSER='%s' is invalid, using default order", env)
         return _DEFAULT_BROWSER_ORDER
     return [env] + [b for b in _DEFAULT_BROWSER_ORDER if b != env]
@@ -269,6 +270,52 @@ def _iter_chrome_cookie_files(browser_name: str) -> List[str]:
     return paths
 
 
+def _iter_zen_cookie_files() -> List[str]:
+    """Discover Zen profiles, including both Linux Flatpak profile locations."""
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        roots = [os.path.join(home, "Library", "Application Support", "zen")]
+    elif sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        roots = [os.path.join(appdata, "zen")] if appdata else []
+    else:
+        roots = [
+            os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "zen"),
+            os.path.join(home, ".zen"),
+            os.path.join(home, ".var", "app", "app.zen_browser.zen", "zen"),
+            os.path.join(home, ".var", "app", "app.zen_browser.zen", ".zen"),
+        ]
+    paths: List[str] = []
+    for root in roots:
+        config = configparser.ConfigParser(interpolation=None)
+        try:
+            config.read(os.path.join(root, "profiles.ini"), encoding="utf-8")
+        except (configparser.Error, OSError, UnicodeError) as exc:
+            logger.debug("Could not read Zen profiles.ini at %s: %s", root, exc)
+            config = configparser.ConfigParser(interpolation=None)
+        # Like Firefox, prefer the install default over the legacy Default=1 profile.
+        defaults = [config[section].get("Default", "") for section in config.sections()
+                    if section.startswith("Install")]
+        profiles = [config[section] for section in config.sections()
+                    if section.startswith("Profile") and config[section].get("Path")]
+        profiles.sort(key=lambda profile: (
+            profile["Path"] not in defaults, profile.get("Default") != "1"
+        ))
+        candidates = []
+        for profile in profiles:
+            directory = profile["Path"]
+            if profile.get("IsRelative", "1") != "0":
+                directory = os.path.join(root, directory)
+            candidates.append(os.path.join(directory, "cookies.sqlite"))
+        # Retain discovery for installations without a readable profiles.ini.
+        for pattern in ("*/cookies.sqlite", "Profiles/*/cookies.sqlite"):
+            candidates.extend(sorted(glob.glob(os.path.join(root, pattern))))
+        for path in candidates:
+            if os.path.isfile(path) and path not in paths:
+                paths.append(path)
+    return paths
+
+
 def _extract_in_process() -> Tuple[Optional[Dict[str, str]], List[str]]:
     """Extract cookies in the main process (required on macOS for Keychain access).
 
@@ -291,6 +338,7 @@ def _extract_in_process() -> Tuple[Optional[Dict[str, str]], List[str]]:
         "chrome": browser_cookie3.chrome,
         "edge": browser_cookie3.edge,
         "firefox": browser_cookie3.firefox,
+        "zen": browser_cookie3.firefox,
         "brave": browser_cookie3.brave,
     }
     attempts: List[str] = []
@@ -298,9 +346,13 @@ def _extract_in_process() -> Tuple[Optional[Dict[str, str]], List[str]]:
 
     for name in _get_browser_order():
         fn = browser_fns[name]
-        if name in _CHROMIUM_BASE_DIRS:
-            # Chromium-based: iterate all profiles
-            cookie_files = _iter_chrome_cookie_files(name)
+        if name in _CHROMIUM_BASE_DIRS or name == "zen":
+            cookie_files = (
+                _iter_zen_cookie_files() if name == "zen" else _iter_chrome_cookie_files(name)
+            )
+            if name == "zen" and not cookie_files:
+                attempts.append("zen=no-profiles")
+                continue
             if not cookie_files:
                 # No profile dirs found — try the default (no cookie_file arg)
                 try:
@@ -423,9 +475,10 @@ def extract_from_jar(jar, name, profile=""):
         return result
     return None
 
-DEFAULT_ORDER = ["arc", "chrome", "edge", "firefox", "brave"]
+ZEN_COOKIE_FILES = __ZEN_COOKIE_FILES__
+DEFAULT_ORDER = ["arc", "chrome", "edge", "firefox", "brave", "zen"]
 env_browser = os.environ.get("TWITTER_BROWSER", "").strip().lower()
-if env_browser in {"arc", "chrome", "edge", "firefox", "brave"}:
+if env_browser in DEFAULT_ORDER:
     browser_order = [env_browser] + [b for b in DEFAULT_ORDER if b != env_browser]
 else:
     browser_order = DEFAULT_ORDER
@@ -434,14 +487,18 @@ browser_fns = {
     "chrome": browser_cookie3.chrome,
     "edge": browser_cookie3.edge,
     "firefox": browser_cookie3.firefox,
+    "zen": browser_cookie3.firefox,
     "brave": browser_cookie3.brave,
 }
 attempts = []
 
 for name in browser_order:
     fn = browser_fns[name]
-    if name in CHROMIUM_BASE_DIRS:
-        cookie_files = iter_cookie_files(name)
+    if name in CHROMIUM_BASE_DIRS or name == "zen":
+        cookie_files = ZEN_COOKIE_FILES if name == "zen" else iter_cookie_files(name)
+        if name == "zen" and not cookie_files:
+            attempts.append("zen=no-profiles")
+            continue
         if not cookie_files:
             try:
                 jar = fn()
@@ -484,6 +541,8 @@ print(json.dumps({
 }))
 sys.exit(1)
 '''
+    # Pass discovery results so the standalone fallback uses the same profile paths.
+    extract_script = extract_script.replace("__ZEN_COOKIE_FILES__", repr(_iter_zen_cookie_files()))
 
     diagnostics: List[str] = []
 
@@ -614,7 +673,7 @@ def get_cookies() -> Dict[str, str]:
             lines.extend("  " + line for line in hint.splitlines())
             lines.append("")
         lines.append("Option 1: Set TWITTER_AUTH_TOKEN and TWITTER_CT0 environment variables")
-        lines.append("Option 2: Make sure you are logged into x.com in your browser (Arc/Chrome/Edge/Firefox/Brave)")
+        lines.append("Option 2: Make sure you are logged into x.com in your browser (Arc/Chrome/Edge/Firefox/Brave/Zen)")
         lines.append("")
         lines.append("Run 'twitter -v <command>' for debug diagnostics.")
         raise AuthenticationError("\n".join(lines))

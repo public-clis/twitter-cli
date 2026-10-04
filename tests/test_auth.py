@@ -412,3 +412,94 @@ def test_extract_in_process_returns_diagnostics_on_failure(monkeypatch) -> None:
 
     assert cookies is None
     assert any("cookie decryption" in d for d in diagnostics)
+
+
+@pytest.mark.parametrize("platform,relative", [
+    ("linux", ".zen/test/cookies.sqlite"),
+    ("linux", ".var/app/app.zen_browser.zen/zen/test/cookies.sqlite"),
+    ("linux", ".var/app/app.zen_browser.zen/.zen/test/cookies.sqlite"),
+    ("darwin", "Library/Application Support/zen/Profiles/test/cookies.sqlite"),
+    ("win32", "zen/Profiles/test/cookies.sqlite"),
+])
+def test_zen_profile_discovery(monkeypatch, tmp_path, platform, relative) -> None:
+    monkeypatch.setattr(auth.sys, "platform", platform)
+    monkeypatch.setattr(auth.os.path, "expanduser", lambda _: str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    cookie_file = tmp_path / relative
+    cookie_file.parent.mkdir(parents=True)
+    cookie_file.touch()
+    assert auth._iter_zen_cookie_files() == [str(cookie_file)]
+
+
+@pytest.mark.parametrize("subprocess_mode", [False, True])
+def test_zen_extracts_from_later_profile(monkeypatch, subprocess_mode) -> None:
+    monkeypatch.setenv("TWITTER_BROWSER", " ZEN ")
+    monkeypatch.setattr(auth, "_iter_zen_cookie_files", lambda: ["empty", "broken", "valid"])
+    calls = []
+
+    def firefox(cookie_file=None):
+        calls.append(cookie_file)
+        if cookie_file == "broken":
+            raise RuntimeError("profile unreadable")
+        if cookie_file != "valid":
+            return []
+        return [SimpleNamespace(domain=".x.com", name=name, value=value)
+                for name, value in [("auth_token", "token"), ("ct0", "csrf"), ("extra", "value")]]
+
+    fake_module = SimpleNamespace(firefox=firefox)
+    for name in ("arc", "chrome", "edge", "brave"):
+        setattr(fake_module, name, lambda: pytest.fail("Zen should succeed first"))
+    monkeypatch.setitem(sys.modules, "browser_cookie3", fake_module)
+    if subprocess_mode:
+        import contextlib
+        import io
+
+        def run(cmd, **kwargs):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), pytest.raises(SystemExit) as exited:
+                exec(cmd[-1], {})
+            assert exited.value.code == 0
+            return SimpleNamespace(stdout=output.getvalue(), stderr="")
+
+        monkeypatch.setattr(auth.subprocess, "run", run)
+        cookies, _ = auth._extract_via_subprocess()
+    else:
+        cookies, _ = auth._extract_in_process()
+    assert calls == ["empty", "broken", "valid"]
+    assert cookies == {"auth_token": "token", "ct0": "csrf",
+                       "cookie_string": "auth_token=token; ct0=csrf; extra=value"}
+
+
+def test_missing_zen_profiles_does_not_read_firefox(monkeypatch) -> None:
+    monkeypatch.setenv("TWITTER_BROWSER", "zen")
+    monkeypatch.setattr(auth, "_DEFAULT_BROWSER_ORDER", ["zen"])
+    monkeypatch.setattr(auth, "_iter_zen_cookie_files", lambda: [])
+    fake_module = SimpleNamespace(**{name: lambda: pytest.fail("No profile should be read")
+                                    for name in ("arc", "chrome", "edge", "brave", "firefox")})
+    monkeypatch.setitem(sys.modules, "browser_cookie3", fake_module)
+    assert auth._extract_in_process() == (None, [])
+
+
+@pytest.mark.parametrize("custom_xdg", [False, True])
+def test_zen_prefers_install_default_and_reads_absolute_profiles(monkeypatch, tmp_path, custom_xdg):
+    monkeypatch.setattr(auth.sys, "platform", "linux")
+    monkeypatch.setattr(auth.os.path, "expanduser", lambda _: str(tmp_path))
+    config_home = tmp_path / ("custom-config" if custom_xdg else ".config")
+    if custom_xdg:
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    else:
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    root = config_home / "zen"
+    installed = root / "release" / "cookies.sqlite"
+    legacy = root / "legacy" / "cookies.sqlite"
+    external = tmp_path / "external" / "cookies.sqlite"
+    for path in (installed, legacy, external):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    (root / "profiles.ini").write_text(
+        "[Profile0]\nPath=legacy\nIsRelative=1\nDefault=1\n"
+        "[Profile1]\nPath=release\nIsRelative=1\n"
+        f"[Profile2]\nPath={external.parent}\nIsRelative=0\n"
+        "[InstallExample]\nDefault=release\n"
+    )
+    assert auth._iter_zen_cookie_files() == [str(installed), str(legacy), str(external)]
