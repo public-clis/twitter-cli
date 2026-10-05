@@ -473,6 +473,9 @@ class TwitterClient:
     # Supported image MIME types and max file size (5 MB)
     _SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
     _MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5 MB
+    _MAX_VIDEO_SIZE = 512 * 1024 * 1024  # 512 MB (X hard cap for tweet_video)
+    _VIDEO_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB per APPEND segment
+    _VIDEO_PROCESS_TIMEOUT = 300  # seconds to wait for async video processing
 
     def _write_delay(self):
         # type: () -> None
@@ -483,26 +486,40 @@ class TwitterClient:
 
     def upload_media(self, file_path):
         # type: (str) -> str
-        """Upload an image file to Twitter.  Returns the media_id string.
+        """Upload an image or video file to Twitter.  Returns the media_id string.
 
         Uses Twitter's chunked upload API (INIT → APPEND → FINALIZE).
-        Supports JPEG, PNG, GIF, and WebP images up to 5 MB.
+        Images: JPEG, PNG, GIF, WebP up to 5 MB (single APPEND segment).
+        Videos (mp4/mov/webm): up to 512 MB, uploaded in 4 MB APPEND chunks,
+        then STATUS-polled until async processing succeeds.  Note: X itself
+        rejects videos longer than 2:20 on non-Premium accounts — that
+        duration error surfaces at CreateTweet, not here.
         """
         if not os.path.isfile(file_path):
             raise MediaUploadError("File not found: %s" % file_path)
 
         file_size = os.path.getsize(file_path)
-        if file_size > self._MAX_IMAGE_SIZE:
-            raise MediaUploadError(
-                "File too large: %.1f MB (max %.0f MB)"
-                % (file_size / (1024 * 1024), self._MAX_IMAGE_SIZE / (1024 * 1024))
-            )
-
         media_type = mimetypes.guess_type(file_path)[0] or ""
-        if media_type not in self._SUPPORTED_IMAGE_TYPES:
-            raise MediaUploadError(
-                "Unsupported image format: %s (supported: jpeg, png, gif, webp)" % media_type
-            )
+        is_video = media_type.startswith("video/")
+
+        if is_video:
+            if file_size > self._MAX_VIDEO_SIZE:
+                raise MediaUploadError(
+                    "File too large: %.1f MB (max %.0f MB)"
+                    % (file_size / (1024 * 1024), self._MAX_VIDEO_SIZE / (1024 * 1024))
+                )
+            media_category = "tweet_video"
+        else:
+            if file_size > self._MAX_IMAGE_SIZE:
+                raise MediaUploadError(
+                    "File too large: %.1f MB (max %.0f MB)"
+                    % (file_size / (1024 * 1024), self._MAX_IMAGE_SIZE / (1024 * 1024))
+                )
+            if media_type not in self._SUPPORTED_IMAGE_TYPES:
+                raise MediaUploadError(
+                    "Unsupported image format: %s (supported: jpeg, png, gif, webp)" % media_type
+                )
+            media_category = "tweet_image"
 
         upload_url = "https://upload.twitter.com/i/media/upload.json"
         session = _get_cffi_session()
@@ -514,6 +531,7 @@ class TwitterClient:
             "command": "INIT",
             "total_bytes": str(file_size),
             "media_type": media_type,
+            "media_category": media_category,
         }
         resp = session.post(upload_url, headers=headers, data=init_data, timeout=30)
         if resp.status_code >= 400:
@@ -525,25 +543,39 @@ class TwitterClient:
         media_id = init_result.get("media_id_string", "")
         if not media_id:
             raise MediaUploadError("INIT did not return media_id")
-        logger.info("Media INIT: media_id=%s", media_id)
+        logger.info("Media INIT: media_id=%s category=%s", media_id, media_category)
 
         # ── APPEND ───────────────────────────────────────────────────
+        segment_index = 0
         with open(file_path, "rb") as f:
-            media_data = base64.b64encode(f.read()).decode("ascii")
-
-        headers = self._build_headers(url=upload_url, method="POST")
-        # Remove JSON content-type — curl_cffi handles multipart encoding
-        headers.pop("Content-Type", None)
-        append_data = {
-            "command": "APPEND",
-            "media_id": media_id,
-            "segment_index": "0",
-            "media_data": media_data,
-        }
-        resp = session.post(upload_url, headers=headers, data=append_data, timeout=60)
-        if resp.status_code >= 400:
-            raise MediaUploadError("APPEND failed (HTTP %d): %s" % (resp.status_code, resp.text[:300]))
-        logger.info("Media APPEND: segment 0 uploaded")
+            while True:
+                media_bytes = f.read(self._VIDEO_CHUNK_SIZE if is_video else None)
+                if not media_bytes:
+                    if segment_index == 0 and not is_video:
+                        media_bytes = b""
+                    else:
+                        break
+                media_data = base64.b64encode(media_bytes).decode("ascii")
+                headers = self._build_headers(url=upload_url, method="POST")
+                # Remove JSON content-type — curl_cffi handles multipart encoding
+                headers.pop("Content-Type", None)
+                append_data = {
+                    "command": "APPEND",
+                    "media_id": media_id,
+                    "segment_index": str(segment_index),
+                    "media_data": media_data,
+                }
+                resp = session.post(upload_url, headers=headers, data=append_data,
+                                    timeout=300 if is_video else 60)
+                if resp.status_code >= 400:
+                    raise MediaUploadError(
+                        "APPEND segment %d failed (HTTP %d): %s"
+                        % (segment_index, resp.status_code, resp.text[:300])
+                    )
+                logger.info("Media APPEND: segment %d uploaded", segment_index)
+                segment_index += 1
+                if not is_video:
+                    break
 
         # ── FINALIZE ─────────────────────────────────────────────────
         headers = self._build_headers(url=upload_url, method="POST")
@@ -556,6 +588,31 @@ class TwitterClient:
         if resp.status_code >= 400:
             raise MediaUploadError("FINALIZE failed (HTTP %d): %s" % (resp.status_code, resp.text[:300]))
         logger.info("Media FINALIZE: media_id=%s ready", media_id)
+
+        # ── STATUS (videos only) ─────────────────────────────────────
+        if is_video:
+            info = json.loads(resp.text).get("processing_info")
+            deadline = time.time() + self._VIDEO_PROCESS_TIMEOUT
+            while info and info.get("state") not in (None, "succeeded"):
+                state = info.get("state")
+                if state == "failed":
+                    raise MediaUploadError(
+                        "Video processing failed: %s" % json.dumps(info.get("error", info))
+                    )
+                wait = int(info.get("check_after_secs", 3))
+                time.sleep(wait)
+                if time.time() > deadline:
+                    raise MediaUploadError(
+                        "Video processing timed out after %ds" % self._VIDEO_PROCESS_TIMEOUT
+                    )
+                headers = self._build_headers(url=upload_url, method="GET")
+                resp = session.get(upload_url, headers=headers, params={
+                    "command": "STATUS", "media_id": media_id,
+                }, timeout=30)
+                if resp.status_code >= 400:
+                    raise MediaUploadError("STATUS failed (HTTP %d): %s" % (resp.status_code, resp.text[:300]))
+                info = json.loads(resp.text).get("processing_info")
+            logger.info("Media STATUS: video processing complete")
 
         return media_id
 

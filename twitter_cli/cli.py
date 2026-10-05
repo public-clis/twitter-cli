@@ -1120,19 +1120,31 @@ def following(screen_name, max_count, as_json, as_yaml):
 # ── Write commands ──────────────────────────────────────────────────────
 
 _MAX_IMAGES = 4  # Twitter allows up to 4 images per tweet
+_MAX_VIDEOS = 1  # X allows 1 video per tweet (or up to 4 images, not both)
 
 
-def _upload_images(client, image_paths, rich_output=True):
-    # type: (TwitterClient, tuple, bool) -> list
-    """Upload images and return list of media_id strings."""
-    if not image_paths:
-        return []
+def _upload_images(client, image_paths, video_paths=None, rich_output=True):
+    # type: (TwitterClient, tuple, Optional[tuple], bool) -> list
+    """Upload images and/or a video and return list of media_id strings."""
+    image_paths = tuple(image_paths or ())
+    video_paths = tuple(video_paths or ())
     if len(image_paths) > _MAX_IMAGES:
         raise click.UsageError("Too many images: max %d, got %d" % (_MAX_IMAGES, len(image_paths)))
+    if len(video_paths) > _MAX_VIDEOS:
+        raise click.UsageError(
+            "Too many videos: max %d, got %d (X allows 1 video per tweet)" % (_MAX_VIDEOS, len(video_paths))
+        )
+    if image_paths and video_paths:
+        raise click.UsageError("Attach images OR a video, not both (X allows one media type per tweet)")
     media_ids = []
+    total = len(image_paths) + len(video_paths)
     for i, path in enumerate(image_paths, 1):
         if rich_output:
-            console.print("📤 Uploading image %d/%d: %s" % (i, len(image_paths), path))
+            console.print("📤 Uploading image %d/%d: %s" % (i, total, path))
+        media_ids.append(client.upload_media(path))
+    for i, path in enumerate(video_paths, 1):
+        if rich_output:
+            console.print("🎥 Uploading video %d/%d: %s" % (i, total, path))
         media_ids.append(client.upload_media(path))
     return media_ids
 
@@ -1163,23 +1175,25 @@ def _write_action(emoji, action_desc, client_method, tweet_id, as_json=False, as
 @click.argument("text")
 @click.option("--reply-to", "-r", default=None, help="Reply to this tweet ID.")
 @click.option("--image", "-i", "images", multiple=True, type=click.Path(exists=True), help="Attach image (up to 4). Repeatable.")
+@click.option("--video", "-V", "videos", multiple=True, type=click.Path(exists=True), help="Attach video (max 1; free accounts: mp4 ≤ 2:20). Repeatable but capped.")
 @structured_output_options
-def post(text, reply_to, images, as_json, as_yaml):
-    # type: (str, Optional[str], tuple, bool, bool) -> None
+def post(text, reply_to, images, videos, as_json, as_yaml):
+    # type: (str, Optional[str], tuple, tuple, bool, bool) -> None
     """Post a new tweet. TEXT is the tweet content.
 
-    Attach images with --image / -i (up to 4):
+    Attach images with --image / -i (up to 4), or one video with --video / -V:
 
     \b
       twitter post "Hello!" --image photo.jpg
       twitter post "Gallery" -i a.png -i b.png -i c.jpg
+      twitter post "Clip:" --video clip.mp4
     """
     normalized_reply_to = _normalize_tweet_id(reply_to) if reply_to else None
     action = "Replying to %s" % normalized_reply_to if normalized_reply_to else "Posting tweet"
     rich_output = not _structured_mode(as_json=as_json, as_yaml=as_yaml)
 
     def operation(client: TwitterClient) -> WritePayload:
-        media_ids = _upload_images(client, images, rich_output=rich_output)
+        media_ids = _upload_images(client, images, video_paths=videos, rich_output=rich_output)
         tweet_id = client.create_tweet(text, reply_to_id=normalized_reply_to, media_ids=media_ids or None)
         return {"success": True, "action": "post", "id": tweet_id, "url": "https://x.com/i/status/%s" % tweet_id}
 
@@ -1199,14 +1213,15 @@ def post(text, reply_to, images, as_json, as_yaml):
 @click.argument("tweet_id")
 @click.argument("text")
 @click.option("--image", "-i", "images", multiple=True, type=click.Path(exists=True), help="Attach image (up to 4). Repeatable.")
+@click.option("--video", "-V", "videos", multiple=True, type=click.Path(exists=True), help="Attach video (max 1; free accounts: mp4 ≤ 2:20). Repeatable but capped.")
 @structured_output_options
-def reply_tweet(tweet_id, text, images, as_json, as_yaml):
-    # type: (str, str, tuple, bool, bool) -> None
+def reply_tweet(tweet_id, text, images, videos, as_json, as_yaml):
+    # type: (str, str, tuple, tuple, bool, bool) -> None
     """Reply to a tweet. TWEET_ID is the tweet to reply to, TEXT is the reply content."""
     tweet_id = _normalize_tweet_id(tweet_id)
     rich_output = not _structured_mode(as_json=as_json, as_yaml=as_yaml)
     def operation(client: TwitterClient) -> WritePayload:
-        media_ids = _upload_images(client, images, rich_output=rich_output)
+        media_ids = _upload_images(client, images, video_paths=videos, rich_output=rich_output)
         new_id = client.create_tweet(text, reply_to_id=tweet_id, media_ids=media_ids or None)
         return {
             "success": True,
@@ -1232,14 +1247,15 @@ def reply_tweet(tweet_id, text, images, as_json, as_yaml):
 @click.argument("tweet_id")
 @click.argument("text")
 @click.option("--image", "-i", "images", multiple=True, type=click.Path(exists=True), help="Attach image (up to 4). Repeatable.")
+@click.option("--video", "-V", "videos", multiple=True, type=click.Path(exists=True), help="Attach video (max 1; free accounts: mp4 ≤ 2:20). Repeatable but capped.")
 @structured_output_options
-def quote_tweet(tweet_id, text, images, as_json, as_yaml):
-    # type: (str, str, tuple, bool, bool) -> None
+def quote_tweet(tweet_id, text, images, videos, as_json, as_yaml):
+    # type: (str, str, tuple, tuple, bool, bool) -> None
     """Quote-tweet a tweet. TWEET_ID is the tweet to quote, TEXT is the commentary."""
     tweet_id = _normalize_tweet_id(tweet_id)
     rich_output = not _structured_mode(as_json=as_json, as_yaml=as_yaml)
     def operation(client: TwitterClient) -> WritePayload:
-        media_ids = _upload_images(client, images, rich_output=rich_output)
+        media_ids = _upload_images(client, images, video_paths=videos, rich_output=rich_output)
         new_id = client.quote_tweet(tweet_id, text, media_ids=media_ids or None)
         return {
             "success": True,
