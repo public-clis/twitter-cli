@@ -1103,9 +1103,18 @@ class TwitterClient:
             # a different TLS fingerprint on the same IP — a detection vector.
             cffi_session = _get_cffi_session()
             ct_headers = _gen_ct_headers()
+            # The logged-out homepage omits the ondemand script needed for
+            # transaction IDs. Send session cookies only to x.com, not its CDN.
             home_page = cffi_session.get(
-                "https://x.com", headers=ct_headers, timeout=10,
+                "https://x.com",
+                headers={
+                    **ct_headers,
+                    "Cookie": self._cookie_string
+                    or "auth_token=%s; ct0=%s" % (self._auth_token, self._ct0),
+                },
+                timeout=10,
             )
+            home_page.raise_for_status()
             home_page_response = bs4.BeautifulSoup(home_page.content, "html.parser")
             ondemand_url = get_ondemand_file_url(response=home_page_response)
             if not ondemand_url:
@@ -1113,6 +1122,7 @@ class TwitterClient:
             ondemand_file = cffi_session.get(
                 ondemand_url, headers=ct_headers, timeout=10,
             )
+            ondemand_file.raise_for_status()
             self._client_transaction = ClientTransaction(
                 home_page_response=home_page_response,
                 ondemand_file_response=ondemand_file.text,

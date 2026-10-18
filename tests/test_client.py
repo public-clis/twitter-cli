@@ -265,6 +265,37 @@ class TestUpdateFeaturesFromHtml:
 
 # ── TwitterClient._build_headers ─────────────────────────────────────────
 
+class TestClientTransactionInit:
+    @pytest.mark.parametrize("cookie_string", [None, "auth_token=token; ct0=csrf; lang=en"])
+    def test_homepage_uses_session_cookies_but_cdn_does_not(self, cookie_string):
+        session = MagicMock()
+        home = MagicMock(text="<html>authenticated homepage</html>")
+        home.content = home.text.encode()
+        script = MagicMock(text="transaction script")
+        session.get.side_effect = [home, script]
+        script_url = "https://abs.twimg.com/responsive-web/client-web/ondemand.s.test.js"
+
+        with (
+            patch.object(TwitterClient, "_load_ct_cache", return_value=False),
+            patch.object(TwitterClient, "_save_ct_cache") as save_cache,
+            patch("twitter_cli.client._get_cffi_session", return_value=session),
+            patch("twitter_cli.client.get_ondemand_file_url", return_value=script_url),
+            patch("twitter_cli.client.ClientTransaction") as transaction,
+            patch("twitter_cli.client._update_features_from_html"),
+        ):
+            client = TwitterClient("token", "csrf", cookie_string=cookie_string)
+
+        homepage_call, cdn_call = session.get.call_args_list
+        assert homepage_call.args == ("https://x.com",)
+        assert homepage_call.kwargs["headers"]["Cookie"] == (
+            cookie_string or "auth_token=token; ct0=csrf"
+        )
+        assert cdn_call.args == (script_url,)
+        assert "Cookie" not in cdn_call.kwargs["headers"]
+        assert client._client_transaction is transaction.return_value
+        save_cache.assert_called_once_with(home.text, script.text)
+
+
 class TestBuildHeaders:
     @patch("twitter_cli.client._get_cffi_session")
     @patch("twitter_cli.client._gen_ct_headers", return_value={})
