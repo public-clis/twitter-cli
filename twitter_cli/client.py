@@ -1125,7 +1125,13 @@ class TwitterClient:
             # Save to cache for future use
             self._save_ct_cache(home_page.text, ondemand_file.text)
         except Exception as exc:
-            logger.warning("Failed to init ClientTransaction: %s", exc)
+            logger.warning(
+                "Failed to init ClientTransaction: %s — x-client-transaction-id is "
+                "UNAVAILABLE. Write requests will be REFUSED (unsigned POSTs get "
+                "accounts suspended). Fix the bootstrap, or set "
+                "TWITTER_ALLOW_UNSIGNED=1 to override.",
+                exc,
+            )
 
     def _build_headers(self, url="", method="GET"):
         # type: (str, str) -> Dict[str, str]
@@ -1159,14 +1165,31 @@ class TwitterClient:
             headers["Content-Type"] = "application/json"
             headers["Referer"] = "https://x.com/compose/post"
             headers["Priority"] = "u=1, i"
-        # Generate x-client-transaction-id if available
+        # Generate x-client-transaction-id. X gates GraphQL writes on this header:
+        # a POST without it is treated as automation (silent fake `344 daily
+        # limit`, or a suspension within ~24-48h). Fail CLOSED instead of
+        # sending an unsigned write.
+        tid = None
         if self._client_transaction and url:
             try:
                 path = urllib.parse.urlparse(url).path
                 tid = self._client_transaction.generate_transaction_id(
                     method=method, path=path,
                 )
-                headers["X-Client-Transaction-Id"] = tid
             except Exception as exc:
                 logger.debug("Failed to generate transaction id: %s", exc)
+        if tid:
+            headers["X-Client-Transaction-Id"] = tid
+        elif method == "POST":
+            msg = (
+                "REFUSING unsigned write: x-client-transaction-id is not available "
+                "(ClientTransaction failed to init). X treats unsigned writes as "
+                "automation and can suspend the account. Fix the ClientTransaction "
+                "bootstrap, or set TWITTER_ALLOW_UNSIGNED=1 to override at your own risk."
+            )
+            if os.environ.get("TWITTER_ALLOW_UNSIGNED") == "1":
+                logger.warning("%s [overridden by TWITTER_ALLOW_UNSIGNED=1]", msg)
+            else:
+                logger.error("%s", msg)
+                raise TwitterAPIError(0, msg)
         return headers

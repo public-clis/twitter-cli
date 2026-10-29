@@ -1356,7 +1356,9 @@ class TestUploadMedia:
         client._max_retries = 3
         client._retry_base_delay = 5.0
         client._max_count = 200
-        client._client_transaction = None
+        # media upload is a POST: it needs a transaction id like any other write
+        client._client_transaction = MagicMock()
+        client._client_transaction.generate_transaction_id.return_value = "tid-media"
         client._ct_init_attempted = True
         return client
 
@@ -1545,3 +1547,64 @@ class TestFetchSearchUsesPost:
 
         assert captured.get("product") == "Latest"
         assert captured.get("querySource") == "typed_query"
+
+
+# ── Fail-closed guard for unsigned writes ────────────────────────────────
+
+
+class TestUnsignedWriteGuard:
+    """X gates GraphQL writes on `x-client-transaction-id`.
+
+    A POST sent without that header is treated as automation by X: it either
+    fails with a misleading `344 "daily limit"` on accounts that never posted,
+    or it goes through and the account is suspended shortly after. When the
+    ClientTransaction bootstrap fails we must refuse the write instead of
+    sending it unsigned.
+    """
+
+    @staticmethod
+    def _client():
+        client = TwitterClient.__new__(TwitterClient)
+        client._auth_token = "test_token"
+        client._ct0 = "test_ct0"
+        client._cookie_string = None
+        client._client_transaction = None
+        client._ct_init_attempted = True
+        return client
+
+    def test_post_without_transaction_id_is_refused(self):
+        client = self._client()
+        with pytest.raises(TwitterAPIError) as exc:
+            client._build_headers("https://x.com/i/api/graphql/qid/CreateTweet", "POST")
+        assert "REFUSING unsigned write" in str(exc.value)
+
+    def test_override_env_allows_unsigned_post(self, monkeypatch):
+        monkeypatch.setenv("TWITTER_ALLOW_UNSIGNED", "1")
+        client = self._client()
+        headers = client._build_headers(
+            "https://x.com/i/api/graphql/qid/CreateTweet", "POST")
+        assert "X-Client-Transaction-Id" not in headers
+
+    def test_get_without_transaction_id_is_allowed(self):
+        client = self._client()
+        headers = client._build_headers(
+            "https://x.com/i/api/graphql/qid/HomeTimeline", "GET")
+        assert "X-Client-Transaction-Id" not in headers
+        assert "Authorization" in headers
+
+    def test_post_with_transaction_id_sets_header(self):
+        client = self._client()
+        transaction = MagicMock()
+        transaction.generate_transaction_id.return_value = "tid-123"
+        client._client_transaction = transaction
+        headers = client._build_headers(
+            "https://x.com/i/api/graphql/qid/CreateTweet", "POST")
+        assert headers["X-Client-Transaction-Id"] == "tid-123"
+
+    def test_failing_generator_also_refuses(self):
+        client = self._client()
+        transaction = MagicMock()
+        transaction.generate_transaction_id.side_effect = RuntimeError("boom")
+        client._client_transaction = transaction
+        with pytest.raises(TwitterAPIError):
+            client._build_headers("https://x.com/i/api/graphql/qid/CreateTweet", "POST")
