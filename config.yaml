@@ -1,6 +1,9 @@
 fetch:
   count: 50
 
+display:
+  time: relative      # relative | absolute | iso  (overridable with --time)
+
 filter:
   mode: "topN"
   topN: 20

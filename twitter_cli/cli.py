@@ -59,6 +59,7 @@ from .formatter import (
     print_tweet_detail,
     print_tweet_table,
     print_user_profile,
+    set_time_style,
     print_user_table,
 )
 from .models import Tweet, UserProfile
@@ -294,15 +295,29 @@ def _run_write_command(
 @click.group()
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
 @click.option("--compact", "-c", is_flag=True, help="Compact output (minimal fields, LLM-friendly).")
+@click.option(
+    "--time",
+    "time_style",
+    type=click.Choice(["relative", "absolute", "iso"]),
+    default=None,
+    help=(
+        "Timestamp style in human-readable output: relative (14d ago), "
+        "absolute (local datetime) or iso. Defaults to config display.time."
+    ),
+)
 @click.version_option(version=__version__)
 @click.pass_context
-def cli(ctx, verbose, compact):
-    # type: (Any, bool, bool) -> None
+def cli(ctx, verbose, compact, time_style):
+    # type: (Any, bool, bool, Optional[str]) -> None
     """twitter — Twitter/X CLI tool 🐦"""
     ensure_utf8_streams()
     _setup_logging(verbose)
     ctx.ensure_object(dict)
     ctx.obj["compact"] = compact
+    # Resolve once, before any rendering: explicit --time wins, then config.
+    if time_style is None:
+        time_style = (load_config().get("display") or {}).get("time")
+    set_time_style(time_style)
 
 
 def _fetch_and_display(fetch_fn, label, emoji, max_count, as_json, as_yaml, output_file, do_filter, config=None, compact=False, full_text=False):

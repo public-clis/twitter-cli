@@ -11,7 +11,38 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .models import Tweet, UserProfile
-from .timeutil import format_local_time, format_relative_time
+from .timeutil import format_iso8601, format_local_time, format_relative_time
+
+# How timestamps are rendered in human-readable output (issue #35).
+#   relative -> "28s ago", "14d ago"   (default, most compact)
+#   absolute -> "2026-03-14 21:08"     (local wall-clock, stable to eyeball)
+#   iso      -> "2026-03-14T21:08:00+00:00"  (unambiguous, scriptable)
+# Single-threaded CLI, so a module-level setting is sufficient; it is set once
+# from the root command (or config) before any rendering happens.
+_TIME_STYLES = ("relative", "absolute", "iso")
+_TIME_STYLE = "relative"
+
+
+def set_time_style(style: Optional[str]) -> str:
+    """Select the timestamp rendering style; returns the style in effect."""
+    global _TIME_STYLE
+    if style and style in _TIME_STYLES:
+        _TIME_STYLE = style
+    return _TIME_STYLE
+
+
+def get_time_style() -> str:
+    """Return the timestamp rendering style currently in effect."""
+    return _TIME_STYLE
+
+
+def _render_time(created_at: str) -> str:
+    """Render one timestamp according to the selected style."""
+    if _TIME_STYLE == "absolute":
+        return format_local_time(created_at)
+    if _TIME_STYLE == "iso":
+        return format_iso8601(created_at)
+    return format_relative_time(created_at)
 
 
 def _make_console() -> Console:
@@ -46,7 +77,7 @@ def print_tweet_table(
         console = _make_console()
 
     if not title:
-        title = "📱 Twitter — %d tweets" % len(tweets)
+        title = "ðŸ“± Twitter â€” %d tweets" % len(tweets)
 
     table = Table(title=title, show_lines=True, expand=True)
     table.add_column("#", style="dim", width=3, justify="right")
@@ -57,10 +88,10 @@ def print_tweet_table(
 
     for i, tweet in enumerate(tweets):
         # Author
-        verified = " ✓" if tweet.author.verified else ""
+        verified = " âœ“" if tweet.author.verified else ""
         author_text = "@%s%s" % (tweet.author.screen_name, verified)
         if tweet.is_retweet and tweet.retweeted_by:
-            author_text += "\n🔄 @%s" % tweet.retweeted_by
+            author_text += "\nðŸ”„ @%s" % tweet.retweeted_by
 
         # Tweet text
         text = tweet.text.replace("\n", " ").strip()
@@ -72,11 +103,11 @@ def print_tweet_table(
             media_icons = []
             for m in tweet.media:
                 if m.type == "photo":
-                    media_icons.append("📷")
+                    media_icons.append("ðŸ“·")
                 elif m.type == "video":
-                    media_icons.append("📹")
+                    media_icons.append("ðŸ“¹")
                 else:
-                    media_icons.append("🎞️")
+                    media_icons.append("ðŸŽžï¸")
             text += " " + " ".join(media_icons)
 
         # Quoted tweet
@@ -85,15 +116,15 @@ def print_tweet_table(
             qt_text = qt.text.replace("\n", " ")
             if not full_text and len(qt_text) > 60:
                 qt_text = qt_text[:57] + "..."
-            text += "\n┌ @%s: %s" % (qt.author.screen_name, qt_text)
+            text += "\nâ”Œ @%s: %s" % (qt.author.screen_name, qt_text)
 
         # Tweet link
-        text += "\n🔗 x.com/%s/status/%s" % (tweet.author.screen_name, tweet.id)
+        text += "\nðŸ”— x.com/%s/status/%s" % (tweet.author.screen_name, tweet.id)
 
         # Stats
-        rel_time = format_relative_time(tweet.created_at)
+        rel_time = _render_time(tweet.created_at)
         stats = (
-            "❤️ %s  🔄 %s\n💬 %s  👁️ %s\n🕐 %s"
+            "â¤ï¸ %s  ðŸ”„ %s\nðŸ’¬ %s  ðŸ‘ï¸ %s\nðŸ• %s"
             % (
                 format_number(tweet.metrics.likes),
                 format_number(tweet.metrics.retweets),
@@ -116,36 +147,36 @@ def print_tweet_detail(tweet: Tweet, console: Optional[Console] = None) -> None:
     if console is None:
         console = _make_console()
 
-    verified = " ✓" if tweet.author.verified else ""
+    verified = " âœ“" if tweet.author.verified else ""
     header = "@%s%s (%s)" % (tweet.author.screen_name, verified, tweet.author.name)
 
     body_parts = []
 
     if tweet.is_retweet and tweet.retweeted_by:
-        body_parts.append("🔄 Retweeted by @%s\n" % tweet.retweeted_by)
+        body_parts.append("ðŸ”„ Retweeted by @%s\n" % tweet.retweeted_by)
 
     body_parts.append(tweet.text)
 
     if tweet.media:
         body_parts.append("")
         for m in tweet.media:
-            icon = "📷" if m.type == "photo" else ("📹" if m.type == "video" else "🎞️")
+            icon = "ðŸ“·" if m.type == "photo" else ("ðŸ“¹" if m.type == "video" else "ðŸŽžï¸")
             body_parts.append("%s %s: %s" % (icon, m.type, m.url))
 
     if tweet.urls:
         body_parts.append("")
         for url in tweet.urls:
-            body_parts.append("🔗 %s" % url)
+            body_parts.append("ðŸ”— %s" % url)
 
     if tweet.quoted_tweet:
         qt = tweet.quoted_tweet
         body_parts.append("")
-        body_parts.append("┌── Quoted @%s ──" % qt.author.screen_name)
+        body_parts.append("â”Œâ”€â”€ Quoted @%s â”€â”€" % qt.author.screen_name)
         body_parts.append(qt.text)
 
     body_parts.append("")
     body_parts.append(
-        "❤️ %s  🔄 %s  💬 %s  🔖 %s  👁️ %s"
+        "â¤ï¸ %s  ðŸ”„ %s  ðŸ’¬ %s  ðŸ”– %s  ðŸ‘ï¸ %s"
         % (
             format_number(tweet.metrics.likes),
             format_number(tweet.metrics.retweets),
@@ -155,10 +186,16 @@ def print_tweet_detail(tweet: Tweet, console: Optional[Console] = None) -> None:
         )
     )
     local_time = format_local_time(tweet.created_at)
-    rel_time = format_relative_time(tweet.created_at)
+    rel_time = _render_time(tweet.created_at)
+    # In the default (relative) view the absolute time is the useful companion;
+    # under absolute/iso the stamp is already unambiguous, so do not repeat it.
+    if _TIME_STYLE == "relative":
+        time_text = "%s (%s)" % (local_time, rel_time)
+    else:
+        time_text = local_time if _TIME_STYLE == "absolute" else rel_time
     body_parts.append(
-        "🕐 %s (%s) · https://x.com/%s/status/%s"
-        % (local_time, rel_time, tweet.author.screen_name, tweet.id)
+        "🕐 %s · https://x.com/%s/status/%s"
+        % (time_text, tweet.author.screen_name, tweet.id)
     )
 
     console.print(Panel(
@@ -196,14 +233,14 @@ def print_article(tweet: Tweet, console: Optional[Console] = None) -> None:
     if console is None:
         console = _make_console()
 
-    verified = " ✓" if tweet.author.verified else ""
+    verified = " âœ“" if tweet.author.verified else ""
     title = tweet.article_title or "Twitter Article"
     meta_parts = [
         "By @%s%s (%s)" % (tweet.author.screen_name, verified, tweet.author.name),
-        "🕐 %s" % tweet.created_at,
-        "🔗 x.com/%s/status/%s" % (tweet.author.screen_name, tweet.id),
+        "ðŸ• %s" % tweet.created_at,
+        "ðŸ”— x.com/%s/status/%s" % (tweet.author.screen_name, tweet.id),
         "",
-        "❤️ %s  🔄 %s  💬 %s  🔖 %s  👁️ %s"
+        "â¤ï¸ %s  ðŸ”„ %s  ðŸ’¬ %s  ðŸ”– %s  ðŸ‘ï¸ %s"
         % (
             format_number(tweet.metrics.likes),
             format_number(tweet.metrics.retweets),
@@ -214,7 +251,7 @@ def print_article(tweet: Tweet, console: Optional[Console] = None) -> None:
     ]
     console.print(Panel(
         "\n".join(meta_parts),
-        title="📰 %s" % title,
+        title="ðŸ“° %s" % title,
         border_style="blue",
         expand=True,
     ))
@@ -234,7 +271,7 @@ def print_filter_stats(
         console = _make_console()
 
     console.print(
-        "📊 Filter: %d → %d tweets" % (original_count, len(filtered))
+        "ðŸ“Š Filter: %d â†’ %d tweets" % (original_count, len(filtered))
     )
     if filtered:
         top_score = filtered[0].score or 0.0
@@ -249,7 +286,7 @@ def print_user_profile(user: UserProfile, console: Optional[Console] = None) -> 
     if console is None:
         console = _make_console()
 
-    verified = " ✓" if user.verified else ""
+    verified = " âœ“" if user.verified else ""
     header = "@%s%s (%s)" % (user.screen_name, verified, user.name)
 
     lines = []
@@ -258,14 +295,14 @@ def print_user_profile(user: UserProfile, console: Optional[Console] = None) -> 
         lines.append("")
 
     if user.location:
-        lines.append("📍 %s" % user.location)
+        lines.append("ðŸ“ %s" % user.location)
     if user.url:
-        lines.append("🔗 %s" % user.url)
+        lines.append("ðŸ”— %s" % user.url)
     if user.location or user.url:
         lines.append("")
 
     lines.append(
-        "👥 %s followers · %s following · %s tweets · %s likes"
+        "ðŸ‘¥ %s followers Â· %s following Â· %s tweets Â· %s likes"
         % (
             format_number(user.followers_count),
             format_number(user.following_count),
@@ -275,8 +312,8 @@ def print_user_profile(user: UserProfile, console: Optional[Console] = None) -> 
     )
 
     if user.created_at:
-        lines.append("📅 Joined %s" % user.created_at)
-    lines.append("🔗 x.com/%s" % user.screen_name)
+        lines.append("ðŸ“… Joined %s" % user.created_at)
+    lines.append("ðŸ”— x.com/%s" % user.screen_name)
 
     console.print(Panel(
         "\n".join(lines),
@@ -296,7 +333,7 @@ def print_user_table(
         console = _make_console()
 
     if not title:
-        title = "👥 Users — %d" % len(users)
+        title = "ðŸ‘¥ Users â€” %d" % len(users)
 
     table = Table(title=title, show_lines=True, expand=True)
     table.add_column("#", style="dim", width=3, justify="right")
@@ -305,7 +342,7 @@ def print_user_table(
     table.add_column("Stats", style="green", width=22, no_wrap=True)
 
     for i, user in enumerate(users):
-        verified = " ✓" if user.verified else ""
+        verified = " âœ“" if user.verified else ""
         user_text = "@%s%s\n%s" % (user.screen_name, verified, user.name)
 
         bio = (user.bio or "").replace("\n", " ").strip()
@@ -313,7 +350,7 @@ def print_user_table(
             bio = bio[:97] + "..."
 
         stats = (
-            "👥 %s followers\n📝 %s following"
+            "ðŸ‘¥ %s followers\nðŸ“ %s following"
             % (
                 format_number(user.followers_count),
                 format_number(user.following_count),
@@ -323,3 +360,4 @@ def print_user_table(
         table.add_row(str(i + 1), user_text, bio, stats)
 
     console.print(table)
+
