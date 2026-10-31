@@ -24,7 +24,10 @@ dependencies = [
     "click>=8.0",
     "rich>=13.0",
     "PyYAML>=6.0",
-    "curl_cffi>=0.7",
+    # >=0.15.0 is required: every earlier release is affected by
+    # GHSA-qw2m-4pqf-rmpp (CVE-2026-33752) — redirect-based SSRF that can reach
+    # internal addresses while bypassing TLS impersonation. High severity.
+    "curl_cffi>=0.15.0",
     "xclienttransaction>=1.0.1",
     "beautifulsoup4>=4.12",
 ]
