@@ -19,7 +19,20 @@ ABC_DIAGNOSTIC = [
 ]
 
 
-def test_windows_abc_failure_names_app_bound_encryption() -> None:
+@pytest.fixture()
+def windows(monkeypatch):
+    """Pin the platform to Windows so these assertions are host-independent.
+
+    `_diagnose_keychain_issues` branches on `sys.platform`; without this they
+    only hold when the suite happens to run on Windows.
+    """
+    monkeypatch.setattr(auth.sys, "platform", "win32")
+    for var in ("SSH_CLIENT", "SSH_TTY", "SSH_CONNECTION"):
+        monkeypatch.delenv(var, raising=False)
+    return monkeypatch
+
+
+def test_windows_abc_failure_names_app_bound_encryption(windows) -> None:
     hint = auth._diagnose_keychain_issues(ABC_DIAGNOSTIC)
 
     assert hint is not None
@@ -28,7 +41,7 @@ def test_windows_abc_failure_names_app_bound_encryption() -> None:
     assert "not a permissions issue" in hint
 
 
-def test_windows_abc_hint_gives_actionable_workarounds() -> None:
+def test_windows_abc_hint_gives_actionable_workarounds(windows) -> None:
     hint = auth._diagnose_keychain_issues(ABC_DIAGNOSTIC)
 
     assert hint is not None
@@ -37,23 +50,21 @@ def test_windows_abc_hint_gives_actionable_workarounds() -> None:
     assert "TWITTER_BROWSER=firefox" in hint
 
 
-def test_windows_generic_failure_keeps_generic_hint() -> None:
+def test_windows_generic_failure_keeps_generic_hint(windows) -> None:
     hint = auth._diagnose_keychain_issues(["chrome: Safe Storage unavailable"])
 
     assert hint is not None
     assert "App-Bound Encryption" not in hint
 
 
-@pytest.mark.skipif(
-    __import__("sys").platform != "win32", reason="Windows-specific message"
-)
-def test_abc_message_is_used_on_windows_only() -> None:
-    """On a real Windows host the decrypt diagnostic maps to the ABC hint."""
+def test_windows_hint_retains_dpapi_advice(windows) -> None:
+    """The non-ABC causes (Chrome lock / VSS shadowcopy) stay documented."""
     hint = auth._diagnose_keychain_issues(ABC_DIAGNOSTIC)
-    assert hint is not None and "App-Bound Encryption" in hint
+    assert hint is not None
+    assert "VSS shadowcopy" in hint
 
 
-def test_non_matching_diagnostic_returns_none() -> None:
+def test_non_matching_diagnostic_returns_none(windows) -> None:
     assert auth._diagnose_keychain_issues(["browser not found"]) is None
 
 
