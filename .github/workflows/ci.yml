@@ -1,23 +1,45 @@
 name: CI
 
+# Pull requests from first-time contributors need a maintainer to approve the
+# workflow run ("action_required"), otherwise no checks are reported and the PR
+# looks untested. Repository admins can switch this off under
+# Settings -> Actions -> General -> "Fork pull request workflows from outside
+# collaborators" (require approval for first-time contributors).
+
 on:
   push:
     branches: ["**"]
   pull_request:
   workflow_call:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
+    # A job with no timeout inherits GitHub's 30-day ceiling: a hung dependency
+    # install or a stalled test keeps the whole PR in "expected" state until
+    # then. Bound it so a stall fails fast and visibly instead.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -26,12 +48,17 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --extra dev
+        timeout-minutes: 10
 
+      # Fail fast on the cheap static checks, then run the suite.
       - name: Lint
         run: uv run ruff check .
+        timeout-minutes: 5
 
       - name: Type check
         run: uv run mypy twitter_cli
+        timeout-minutes: 5
 
       - name: Test
         run: uv run pytest -q
+        timeout-minutes: 10
