@@ -67,6 +67,28 @@ def _diagnose_keychain_issues(diagnostics: List[str]) -> Optional[str]:
             "  Or click \"Always Allow\" when the Keychain authorization popup appears."
         )
     if sys.platform == "win32":
+        if "decrypt" in lowered and "key" in lowered:
+            # Chrome/Edge >=127 on Windows encrypt cookies with App-Bound
+            # Encryption (a key tied to the browser binary), which
+            # browser_cookie3 cannot unwrap. This is the dominant Windows
+            # failure since mid-2024 and is not an admin-permissions problem,
+            # so give the concrete workaround instead of a generic hint.
+            return (
+                "Windows: Chrome/Edge cookie decryption failed (DPAPI/App-Bound Encryption).\n"
+                "  This is usually App-Bound Encryption (Chrome/Edge 127+), which\n"
+                "  browser_cookie3 cannot decrypt. It is not a permissions issue, so\n"
+                "  running as admin will not help.\n"
+                "  If this is not App-Bound Encryption: close Chrome (it locks the\n"
+                "  cookie database), or run as admin to allow a VSS shadowcopy.\n"
+                "  Options:\n"
+                "    1. Use Firefox for x.com — Firefox cookies are still readable:\n"
+                "         set TWITTER_BROWSER=firefox\n"
+                "    2. Export cookies manually and pass them as env vars:\n"
+                "         set TWITTER_AUTH_TOKEN=<auth_token>\n"
+                "         set TWITTER_CT0=<ct0>\n"
+                "       In DevTools: Application -> Cookies -> https://x.com\n"
+                "       (auth_token and ct0), or use a cookie-export extension."
+            )
         return (
             "Windows DPAPI cookie decryption failed.\n"
             "  Possible causes:\n"

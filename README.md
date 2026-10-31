@@ -167,6 +167,15 @@ twitter unretweet 1234567890
 twitter bookmark 1234567890
 twitter unbookmark 1234567890
 twitter follow elonmusk --json
+
+# Timestamps: relative (default), absolute, or ISO
+twitter feed --time absolute
+twitter feed --time iso
+
+# Shell completions (bash / zsh / fish)
+twitter completion bash >> ~/.bashrc
+twitter completion zsh  > "${fpath[1]}/_twitter"
+twitter completion fish > ~/.config/fish/completions/twitter.fish
 ```
 
 ### Authentication

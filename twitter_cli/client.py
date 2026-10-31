@@ -68,8 +68,12 @@ _cffi_session = None
 
 TimelineInstructionGetter = Callable[[Any], Any]
 
-# Hard ceiling to prevent accidental massive fetches
-_ABSOLUTE_MAX_COUNT = 500
+# Hard ceiling to prevent accidental massive fetches. This is a safety valve
+# against a typo or a runaway config, not a policy limit: an explicit --max is
+# honoured up to here. User lists (followers/following) are paginated cursors
+# and are the main reason this is above the old 500, which silently truncated
+# requests for larger accounts (issue #50).
+_ABSOLUTE_MAX_COUNT = 10000
 
 
 # ── Session management ───────────────────────────────────────────────────
@@ -826,10 +830,22 @@ class TwitterClient:
 
     def _fetch_user_list(self, operation_name, user_id, count, get_instructions, use_post=False):
         # type: (str, str, int, Callable[[Any], Any], bool) -> List[UserProfile]
-        """Generic user list fetcher (for followers/following) with pagination."""
+        """Generic user list fetcher (for followers/following) with pagination.
+
+        An explicit request is honoured up to ``_ABSOLUTE_MAX_COUNT``. The
+        configured ``rateLimit.maxCount`` is a *default* for calls that do not
+        specify a count, not a ceiling on an explicit ``--max``: clamping here
+        used to silently truncate large accounts at 500 users (issue #50).
+        """
         if count <= 0:
             return []
-        count = min(count, self._max_count)
+        if count > _ABSOLUTE_MAX_COUNT:
+            logger.warning(
+                "Requested %d users exceeds the safety ceiling; fetching %d",
+                count,
+                _ABSOLUTE_MAX_COUNT,
+            )
+            count = _ABSOLUTE_MAX_COUNT
         users = []  # type: List[UserProfile]
         seen_ids = set()  # type: Set[str]
         cursor = None  # type: Optional[str]
@@ -1169,4 +1185,15 @@ class TwitterClient:
                 headers["X-Client-Transaction-Id"] = tid
             except Exception as exc:
                 logger.debug("Failed to generate transaction id: %s", exc)
+        if method != "GET" and "X-Client-Transaction-Id" not in headers:
+            # Writes are what get accounts flagged: X treats an unsigned POST as
+            # automation. Reads without the header usually just 404, so only warn
+            # for writes. Do not refuse — the user's change may still land — but
+            # make the risk visible instead of silent (issue #72).
+            logger.warning(
+                "Sending an UNSIGNED %s request: x-client-transaction-id is "
+                "unavailable, which X may treat as automation. If the bootstrap "
+                "is broken, fix it before doing bulk writes.",
+                method,
+            )
         return headers
