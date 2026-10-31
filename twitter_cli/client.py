@@ -1185,4 +1185,15 @@ class TwitterClient:
                 headers["X-Client-Transaction-Id"] = tid
             except Exception as exc:
                 logger.debug("Failed to generate transaction id: %s", exc)
+        if method != "GET" and "X-Client-Transaction-Id" not in headers:
+            # Writes are what get accounts flagged: X treats an unsigned POST as
+            # automation. Reads without the header usually just 404, so only warn
+            # for writes. Do not refuse — the user's change may still land — but
+            # make the risk visible instead of silent (issue #72).
+            logger.warning(
+                "Sending an UNSIGNED %s request: x-client-transaction-id is "
+                "unavailable, which X may treat as automation. If the bootstrap "
+                "is broken, fix it before doing bulk writes.",
+                method,
+            )
         return headers
