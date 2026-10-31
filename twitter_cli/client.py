@@ -11,6 +11,7 @@ import os
 import random
 import time
 import urllib.parse
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, cast
 
 import bs4
@@ -18,6 +19,7 @@ from curl_cffi import requests as _cffi_requests
 from x_client_transaction import ClientTransaction
 from x_client_transaction.utils import generate_headers as _gen_ct_headers, get_ondemand_file_url
 
+from .cache import _open_owner_only, _tighten_dir
 from .constants import (
     BEARER_TOKEN,
     SEC_CH_UA_BITNESS,
@@ -1066,17 +1068,23 @@ class TwitterClient:
 
     def _save_ct_cache(self, home_html, ondemand_text):
         # type: (str, str) -> None
-        """Save transaction data to cache file."""
+        """Save transaction data to cache file.
+
+        The written JSON embeds the full x.com/home HTML, which carries the
+        session's live auth_token/ct0, so the file and its directory are locked
+        to the owner (0600 / 0700) rather than the process umask default.
+        """
         try:
             cache_path = self._ct_cache_path()
             cache_dir = os.path.dirname(cache_path)
             os.makedirs(cache_dir, exist_ok=True)
+            _tighten_dir(Path(cache_dir))
             cache = {
                 "home_html": home_html,
                 "ondemand_text": ondemand_text,
                 "created_at": time.time(),
             }
-            with open(cache_path, "w", encoding="utf-8") as f:
+            with _open_owner_only(Path(cache_path)) as f:
                 json.dump(cache, f)
             logger.debug("Saved CT cache to %s", cache_path)
         except Exception as exc:
