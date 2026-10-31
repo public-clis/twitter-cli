@@ -18,4 +18,4 @@ rateLimit:
   requestDelay: 1.5    # seconds between paginated requests
   maxRetries: 3        # retry count on 429 / rate-limit errors
   retryBaseDelay: 5.0  # base delay for exponential backoff (seconds)
-  maxCount: 200        # hard cap for single fetch
+  maxCount: 200        # default cap for a single fetch; an explicit --max may exceed it
