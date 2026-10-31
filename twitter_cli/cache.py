@@ -40,13 +40,16 @@ def _open_owner_only(path: Path) -> IO[str]:
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
     fd = os.open(str(path), flags, _OWNER_ONLY_FILE)
     try:
-        # Not declared on every platform by typeshed; guarded on AttributeError.
-        os.fchmod(fd, _OWNER_ONLY_FILE)  # type: ignore[attr-defined]
-    except (AttributeError, OSError):  # pragma: no cover - platform dependent
-        try:
+        # Resolved via getattr: fchmod is absent from typeshed on some platforms,
+        # so a direct call needs a version-dependent type: ignore, while being
+        # genuinely available at runtime on every POSIX host.
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(fd, _OWNER_ONLY_FILE)
+        else:  # pragma: no cover - non-POSIX
             os.chmod(str(path), _OWNER_ONLY_FILE)
-        except OSError:
-            pass
+    except OSError:  # pragma: no cover - permission change is best-effort
+        pass
     return os.fdopen(fd, "w", encoding="utf-8")
 
 
