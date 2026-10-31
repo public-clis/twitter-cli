@@ -21,7 +21,9 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pin the runner image: "ubuntu-latest" is a moving target (it migrates to
+    # Ubuntu 26 in Oct 2026), which makes a failure hard to attribute.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
