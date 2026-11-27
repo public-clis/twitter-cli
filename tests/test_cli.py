@@ -947,3 +947,73 @@ def test_cli_bookmarks_cursor_pagination(monkeypatch, tweet_factory) -> None:
     assert payload["data"][0]["id"] == "77"
     assert payload["pagination"]["nextCursor"] == "bm-cursor-2"
     assert captured == {"cursor": "bm-cursor-1", "return_cursor": True}
+
+
+def test_cli_news_json(monkeypatch) -> None:
+    captured = {}
+
+    class FakeClient:
+        def fetch_explore_news(self, count: int):
+            captured["count"] = count
+            return [
+                {
+                    "rank": 1,
+                    "title": "Major AI story",
+                    "context": "Trending now · News · 105 posts",
+                    "post_count": 105,
+                    "url": "https://x.com/i/trending/123",
+                }
+            ]
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 50}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["news", "--max", "5", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"][0]["title"] == "Major AI story"
+    assert captured == {"count": 5}
+
+
+def test_cli_doctor_json_never_leaks_secrets(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("TWITTER_AUTH_TOKEN", "super-secret-auth-token")
+    monkeypatch.setenv("TWITTER_CT0", "super-secret-ct0")
+    monkeypatch.setattr("twitter_cli.cli._qid_cache_path", lambda: tmp_path / "missing.json")
+    monkeypatch.setattr(
+        "twitter_cli.cli.TwitterClient._ct_cache_path",
+        staticmethod(lambda: str(tmp_path / "missing_ct.json")),
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["doctor", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert "super-secret-auth-token" not in result.output
+    assert "super-secret-ct0" not in result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    categories = {c["category"] for c in payload["data"]["checks"]}
+    assert {"deps", "config", "auth", "tx_cache", "query_ids"}.issubset(categories)
+
+
+def test_cli_like_accepts_full_tweet_url(monkeypatch) -> None:
+    called = []
+
+    class FakeClient:
+        def like_tweet(self, tweet_id: str):
+            called.append(tweet_id)
+            return True
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["like", "https://x.com/alice/status/987654321", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert called == ["987654321"]

@@ -42,15 +42,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import click
+from click.shell_completion import get_completion_class
 from rich.console import Console
+from rich.table import Table
 import yaml
 
 from . import __version__
-from .auth import get_cookies
+from .auth import get_cookies, load_from_env
 from .cache import resolve_cached_tweet, save_tweet_cache
 from .exceptions import TwitterError
-from .client import TwitterClient
-from .config import load_config
+from .client import TwitterClient, _url_fetch
+from .config import _resolve_config_path, load_config
 from .filter import filter_tweets
 from .formatter import (
     article_to_markdown,
@@ -60,7 +62,9 @@ from .formatter import (
     print_tweet_table,
     print_user_profile,
     print_user_table,
+    set_time_style,
 )
+from .graphql import FALLBACK_QUERY_IDS, _qid_cache_path, refresh_query_ids
 from .models import Tweet, UserProfile
 from .output import (
     default_structured_format,
@@ -96,6 +100,7 @@ FEED_TYPES = ["for-you", "following"]
 SEARCH_PRODUCTS = ["Top", "Latest", "Photos", "Videos"]
 SEARCH_HAS_CHOICES = ["links", "images", "videos", "media"]
 SEARCH_EXCLUDE_CHOICES = ["retweets", "replies", "links"]
+_COMPLETION_SHELLS = ("bash", "zsh", "fish")
 
 
 def _agent_user_profile(profile: UserProfile) -> dict:
@@ -294,15 +299,28 @@ def _run_write_command(
 @click.group()
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
 @click.option("--compact", "-c", is_flag=True, help="Compact output (minimal fields, LLM-friendly).")
+@click.option(
+    "--time",
+    "time_style",
+    type=click.Choice(["relative", "absolute", "iso"]),
+    default=None,
+    help=(
+        "Timestamp style in human-readable output: relative (14d ago), "
+        "absolute (local datetime), or iso. Defaults to config display.time."
+    ),
+)
 @click.version_option(version=__version__)
 @click.pass_context
-def cli(ctx, verbose, compact):
-    # type: (Any, bool, bool) -> None
+def cli(ctx, verbose, compact, time_style):
+    # type: (Any, bool, bool, Optional[str]) -> None
     """twitter — Twitter/X CLI tool 🐦"""
     ensure_utf8_streams()
     _setup_logging(verbose)
     ctx.ensure_object(dict)
     ctx.obj["compact"] = compact
+    if time_style is None:
+        time_style = (load_config().get("display") or {}).get("time")
+    set_time_style(time_style)
 
 
 def _fetch_and_display(fetch_fn, label, emoji, max_count, as_json, as_yaml, output_file, do_filter, config=None, compact=False, full_text=False):
@@ -346,6 +364,27 @@ def _fetch_and_display(fetch_fn, label, emoji, max_count, as_json, as_yaml, outp
         full_text=full_text,
     )
     _print_show_hint()
+    console.print()
+
+
+def _print_news_table(stories, title="News stories"):
+    # type: (List[dict], str) -> None
+    """Print Explore News stories in a compact table."""
+    table = Table(title=title, show_lines=False)
+    table.add_column("#", justify="right", style="dim", width=4)
+    table.add_column("Story", style="bold", overflow="fold")
+    table.add_column("Context", overflow="fold")
+    table.add_column("Posts", justify="right")
+
+    for story in stories:
+        count = story.get("post_count")
+        table.add_row(
+            str(story.get("rank", "")),
+            str(story.get("title", "")),
+            str(story.get("context", "") or story.get("category", "") or ""),
+            f"{count:,}" if isinstance(count, int) and count > 0 else "",
+        )
+    console.print(table)
     console.print()
 
 
@@ -1190,6 +1229,7 @@ def _write_action(emoji, action_desc, client_method, tweet_id, as_json=False, as
 
     Emits structured JSON/YAML when piped or when OUTPUT env is set.
     """
+    tweet_id = _normalize_tweet_id(tweet_id)
     action_name = action_desc.lower().replace(" ", "_")
 
     def operation(client: TwitterClient) -> WritePayload:
@@ -1483,6 +1523,161 @@ def unbookmark(tweet_id, as_json, as_yaml):
     _write_action("🔖", "Removing bookmark", "unbookmark_tweet", tweet_id, as_json=as_json, as_yaml=as_yaml)
 
 
+
+
+@cli.command(name="news")
+@click.option("--max", "-n", "max_count", type=int, default=20, show_default=True, help="Max stories to return.")
+@structured_output_options
+def news(max_count, as_json, as_yaml):
+    # type: (int, bool, bool) -> None
+    """Fetch personalized stories from Explore > News."""
+    config = load_config()
+
+    def _run():
+        rich_output = use_rich_output(as_json=as_json, as_yaml=as_yaml)
+        client = _get_client(config, quiet=not rich_output)
+        if rich_output:
+            console.print("🗞️ Fetching Explore > News stories...\n")
+        stories = client.fetch_explore_news(count=max_count)
+
+        if emit_structured(stories, as_json=as_json, as_yaml=as_yaml):
+            return
+
+        _print_news_table(stories, title="🗞️ Explore News — %d stories" % len(stories))
+
+    _run_guarded(_run)
+
+
+@cli.command(name="completion")
+@click.argument("shell", type=click.Choice(sorted(_COMPLETION_SHELLS)))
+def completion(shell):
+    # type: (str) -> None
+    """Print a shell completion script for SHELL.
+
+    \b
+    bash:  twitter completion bash >> ~/.bashrc
+    zsh:   twitter completion zsh  > "${fpath[1]}/_twitter"
+    fish:  twitter completion fish > ~/.config/fish/completions/twitter.fish
+    """
+    completion_cls = get_completion_class(shell)
+    if completion_cls is None:  # pragma: no cover - guarded by Choice
+        raise click.ClickException("Shell completion is not supported for %r" % shell)
+    click.echo(completion_cls(cli, {}, "twitter", "_TWITTER_COMPLETE").source())
+
+
+@cli.command(name="doctor")
+@click.option("--refresh", is_flag=True, help="Refresh cached GraphQL query IDs from live sources.")
+@structured_output_options
+def doctor(refresh, as_json, as_yaml):
+    # type: (bool, bool, bool) -> None
+    """Run local diagnostics for dependencies, config, auth presence, and caches.
+
+    Never prints raw cookies or secrets.
+    """
+    checks = []  # type: List[Dict[str, Any]]
+
+    # 1. Dependency versions
+    try:
+        import curl_cffi
+        curl_ver = getattr(curl_cffi, "__version__", "unknown")
+    except Exception:
+        curl_ver = "missing"
+    try:
+        from importlib.metadata import version as _pkg_version
+        xct_ver = _pkg_version("xclienttransaction")
+    except Exception:
+        xct_ver = "unknown"
+    checks.append({
+        "category": "deps",
+        "status": "pass" if curl_ver != "missing" else "error",
+        "message": "curl_cffi=%s, xclienttransaction=%s" % (curl_ver, xct_ver),
+    })
+
+    # 2. Config resolution
+    resolved_cfg = _resolve_config_path(None)
+    checks.append({
+        "category": "config",
+        "status": "pass",
+        "message": str(resolved_cfg) if resolved_cfg else "built-in defaults",
+    })
+
+    # 3. Auth presence (metadata only — never reveal cookie values)
+    env_cookies = load_from_env()
+    if env_cookies:
+        source = "env:cookie_string" if env_cookies.get("cookie_string") else "env:tokens"
+        checks.append({
+            "category": "auth",
+            "status": "pass",
+            "message": "Credentials present (%s)" % source,
+        })
+    else:
+        checks.append({
+            "category": "auth",
+            "status": "warning",
+            "message": "No env credentials set; commands will attempt browser cookie extraction",
+        })
+
+    # 4. Transaction cache status
+    ct_path = Path(TwitterClient._ct_cache_path())
+    if ct_path.exists():
+        try:
+            ct_payload = json.loads(ct_path.read_text(encoding="utf-8"))
+            age_s = int(time.time() - float(ct_payload.get("created_at", 0)))
+            fresh = age_s <= 3600
+            checks.append({
+                "category": "tx_cache",
+                "status": "pass" if fresh else "warning",
+                "message": "Transaction cache %s (age=%ds)" % ("fresh" if fresh else "expired", age_s),
+            })
+        except Exception as exc:
+            checks.append({
+                "category": "tx_cache",
+                "status": "warning",
+                "message": "Transaction cache unreadable: %s" % exc,
+            })
+    else:
+        checks.append({
+            "category": "tx_cache",
+            "status": "warning",
+            "message": "Transaction cache not initialized yet",
+        })
+
+    # 5. Query IDs cache / live refresh
+    qid_path = _qid_cache_path()
+    if refresh:
+        refreshed = refresh_query_ids(_url_fetch)
+        checks.append({
+            "category": "query_ids",
+            "status": "pass" if refreshed else "warning",
+            "message": "Refreshed %d live queryIds (fallback baseline: %d)" % (
+                len(refreshed), len(FALLBACK_QUERY_IDS)
+            ),
+        })
+    else:
+        cached_count = 0
+        if qid_path.exists():
+            try:
+                cached_count = len(json.loads(qid_path.read_text(encoding="utf-8")).get("query_ids", {}))
+            except Exception:
+                cached_count = 0
+        checks.append({
+            "category": "query_ids",
+            "status": "pass",
+            "message": "Fallback baseline=%d, disk cache=%d" % (len(FALLBACK_QUERY_IDS), cached_count),
+        })
+
+    if emit_structured({"checks": checks}, as_json=as_json, as_yaml=as_yaml):
+        return
+
+    table = Table(title="🩺 twitter-cli doctor")
+    table.add_column("Check", style="cyan")
+    table.add_column("Status", style="bold")
+    table.add_column("Details")
+    for item in checks:
+        icon = "✅" if item["status"] == "pass" else ("⚠️" if item["status"] == "warning" else "❌")
+        table.add_row(item["category"], "%s %s" % (icon, item["status"]), item["message"])
+    console.print(table)
+    console.print()
 
 
 if __name__ == "__main__":
