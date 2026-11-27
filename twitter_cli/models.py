@@ -1,6 +1,7 @@
 """Data models for twitter-cli.
 
-Defines Tweet, Author, Metrics, and TweetMedia as simple dataclasses.
+Defines Tweet, Author, Metrics, TweetMedia, BookmarkFolder, and UserProfile
+as simple dataclasses.
 """
 
 from __future__ import annotations
@@ -16,6 +17,10 @@ class Author:
     screen_name: str
     profile_image_url: str = ""
     verified: bool = False
+    followers_count: int = 0
+    following_count: int = 0
+    viewer_following: Optional[bool] = None
+    viewer_followed_by: Optional[bool] = None
 
 
 @dataclass
@@ -34,6 +39,12 @@ class TweetMedia:
     url: str
     width: Optional[int] = None
     height: Optional[int] = None
+    adult_content: bool = False
+    graphic_violence: bool = False
+    other_warning: bool = False
+    poster_url: Optional[str] = None
+    alt_text: Optional[str] = None
+    duration_ms: Optional[int] = None
 
 
 @dataclass
@@ -54,6 +65,11 @@ class Tweet:
     article_text: Optional[str] = None
     is_subscriber_only: bool = False
     is_promoted: bool = False
+    possibly_sensitive: bool = False
+    conversation_id: Optional[str] = None
+    in_reply_to_status_id: Optional[str] = None
+    in_reply_to_user_id: Optional[str] = None
+    in_reply_to_screen_name: Optional[str] = None
 
 
 @dataclass
@@ -77,3 +93,5 @@ class UserProfile:
     verified: bool = False
     profile_image_url: str = ""
     created_at: str = ""
+    viewer_following: Optional[bool] = None
+    viewer_followed_by: Optional[bool] = None

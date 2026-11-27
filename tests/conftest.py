@@ -40,6 +40,11 @@ def tweet_factory():
             article_text=overrides.pop("article_text", None),
             is_subscriber_only=overrides.pop("is_subscriber_only", False),
             is_promoted=overrides.pop("is_promoted", False),
+            possibly_sensitive=overrides.pop("possibly_sensitive", False),
+            conversation_id=overrides.pop("conversation_id", None),
+            in_reply_to_status_id=overrides.pop("in_reply_to_status_id", None),
+            in_reply_to_user_id=overrides.pop("in_reply_to_user_id", None),
+            in_reply_to_screen_name=overrides.pop("in_reply_to_screen_name", None),
         )
 
     return _make_tweet

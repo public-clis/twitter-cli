@@ -1832,3 +1832,66 @@ class TestUnsignedWriteGuard:
         client._client_transaction = transaction
         with pytest.raises(TwitterAPIError):
             client._build_headers("https://x.com/i/api/graphql/qid/CreateTweet", "POST")
+
+
+class TestTweetDetailFetch:
+    def test_raises_when_focal_tweet_is_missing(self):
+        from twitter_cli.exceptions import NotFoundError
+
+        client = TwitterClient.__new__(TwitterClient)
+        client._fetch_timeline = MagicMock(return_value=[MagicMock(id="reply-1")])
+
+        with pytest.raises(
+            NotFoundError,
+            match="Tweet 123 was not returned by the TweetDetail response",
+        ):
+            client.fetch_tweet_detail("123", 20)
+
+    def test_places_focal_tweet_before_replies(self):
+        client = TwitterClient.__new__(TwitterClient)
+        reply = MagicMock(id="reply-1")
+        focal_tweet = MagicMock(id="123")
+        client._fetch_timeline = MagicMock(return_value=[reply, focal_tweet])
+
+        tweets = client.fetch_tweet_detail("123", 20)
+
+        assert tweets == [focal_tweet, reply]
+
+    def test_supports_cursor_and_return_cursor(self):
+        client = TwitterClient.__new__(TwitterClient)
+        reply = MagicMock(id="reply-2")
+        client._fetch_timeline = MagicMock(return_value=([reply], "next-cur"))
+
+        tweets, next_cursor = client.fetch_tweet_detail(
+            "123", 20, cursor="prev-cur", return_cursor=True
+        )
+
+        assert tweets == [reply]
+        assert next_cursor == "next-cur"
+
+
+class TestFetchUserByNumericId:
+    def test_fetch_user_routes_numeric_id_to_user_by_rest_id(self):
+        client = TwitterClient.__new__(TwitterClient)
+        calls = []
+
+        def mock_get(operation_name, variables, features, field_toggles=None):
+            calls.append((operation_name, variables))
+            return {
+                "data": {
+                    "user": {
+                        "result": {
+                            "rest_id": "44196397",
+                            "core": {"name": "Elon Musk", "screen_name": "elonmusk"},
+                            "relationship_counts": {"followers": 1000, "following": 50},
+                        }
+                    }
+                }
+            }
+
+        client._graphql_get = mock_get
+        profile = client.fetch_user("44196397")
+        assert calls[0][0] == "UserByRestId"
+        assert calls[0][1]["userId"] == "44196397"
+        assert profile.screen_name == "elonmusk"
+        assert profile.followers_count == 1000

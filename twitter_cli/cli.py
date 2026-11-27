@@ -358,25 +358,56 @@ def _emit_timeline_structured(tweets, next_cursor, *, as_json, as_yaml):
     return emit_structured(payload, as_json=as_json, as_yaml=as_yaml)
 
 
-def _run_bookmarks_command(max_count, as_json, as_yaml, output_file, do_filter, compact=False, full_text=False):
-    # type: (Optional[int], bool, bool, Optional[str], bool, bool, bool) -> None
+def _run_bookmarks_command(
+    max_count, as_json, as_yaml, output_file, do_filter, compact=False, full_text=False, cursor=None
+):
+    # type: (Optional[int], bool, bool, Optional[str], bool, bool, bool, Optional[str]) -> None
+    """Fetch bookmarks with optional cursor-based pagination."""
     config = load_config()
+    rich_output = use_rich_output(as_json=as_json, as_yaml=as_yaml, compact=compact)
 
     def _run():
-        client = _get_client(config)
-        _fetch_and_display(
-            lambda count: client.fetch_bookmarks(count),
-            "bookmarks",
-            "🔖",
-            max_count,
-            as_json,
-            as_yaml,
-            output_file,
-            do_filter,
-            config,
-            compact=compact,
+        client = _get_client(config, quiet=not rich_output)
+        fetch_count = _resolve_configured_count(config, max_count)
+        if rich_output:
+            console.print("🔖 Fetching bookmarks (%d tweets)...\n" % fetch_count)
+        start = time.time()
+        try:
+            result = client.fetch_bookmarks(fetch_count, cursor=cursor, return_cursor=True)
+        except TypeError:
+            result = (client.fetch_bookmarks(fetch_count), None)
+        if isinstance(result, tuple) and len(result) == 2:
+            tweets, next_cursor = result
+        else:
+            tweets, next_cursor = result, None
+        elapsed = time.time() - start
+        if rich_output:
+            console.print("✅ Fetched %d bookmarks in %.1fs\n" % (len(tweets), elapsed))
+
+        filtered = _apply_filter(tweets, do_filter, config, rich_output=rich_output)
+
+        if output_file:
+            Path(output_file).write_text(tweets_to_json(filtered), encoding="utf-8")
+            if rich_output:
+                console.print("💾 Saved to %s\n" % output_file)
+
+        if compact:
+            click.echo(tweets_to_compact_json(filtered))
+            return
+
+        save_tweet_cache(filtered)
+
+        if _emit_timeline_structured(filtered, next_cursor, as_json=as_json, as_yaml=as_yaml):
+            return
+
+        print_tweet_table(
+            filtered,
+            console,
+            title="🔖 Bookmarks — %d tweets" % len(filtered),
             full_text=full_text,
         )
+        _print_show_hint()
+        console.print()
 
     _run_guarded(_run)
 
@@ -509,13 +540,14 @@ def favorites(ctx, max_count, as_json, as_yaml, output_file, do_filter, full_tex
 
 @cli.group(name="bookmarks", invoke_without_command=True)
 @click.option("--max", "-n", "max_count", type=int, default=None, help="Max number of tweets to fetch.")
+@click.option("--cursor", type=str, default=None, help="Pagination cursor to continue a previous bookmarks fetch.")
 @structured_output_options
 @click.option("--output", "-o", "output_file", type=str, default=None, help="Save tweets to JSON file.")
 @click.option("--filter", "do_filter", is_flag=True, help="Enable score-based filtering.")
 @click.option("--full-text", is_flag=True, help="Show full tweet text in table output.")
 @click.pass_context
-def bookmarks(ctx, max_count, as_json, as_yaml, output_file, do_filter, full_text):
-    # type: (Any, Optional[int], bool, bool, Optional[str], bool, bool) -> None
+def bookmarks(ctx, max_count, cursor, as_json, as_yaml, output_file, do_filter, full_text):
+    # type: (Any, Optional[int], Optional[str], bool, bool, Optional[str], bool, bool) -> None
     """Fetch bookmarked tweets, or manage bookmark folders."""
     if ctx.invoked_subcommand is None:
         _run_bookmarks_command(
@@ -526,6 +558,7 @@ def bookmarks(ctx, max_count, as_json, as_yaml, output_file, do_filter, full_tex
             do_filter,
             compact=ctx.obj.get("compact", False),
             full_text=full_text,
+            cursor=cursor,
         )
 
 
@@ -852,39 +885,53 @@ def likes(ctx, screen_name, max_count, as_json, as_yaml, output_file, do_filter,
 @cli.command()
 @click.argument("tweet_id")
 @click.option("--max", "-n", "max_count", type=int, default=None, help="Max replies to fetch.")
+@click.option("--cursor", type=str, default=None, help="Pagination cursor for continuing a thread fetch.")
 @click.option("--full-text", is_flag=True, help="Show full reply text in table output.")
 @structured_output_options
 @click.pass_context
-def tweet(ctx, tweet_id, max_count, full_text, as_json, as_yaml):
-    # type: (Any, str, int, bool, bool, bool) -> None
+def tweet(ctx, tweet_id, max_count, cursor, full_text, as_json, as_yaml):
+    # type: (Any, str, Optional[int], Optional[str], bool, bool, bool) -> None
     """View a tweet and its replies. TWEET_ID is the numeric tweet ID or full URL."""
     compact = ctx.obj.get("compact", False)
     tweet_id = _normalize_tweet_id(tweet_id)
     config = load_config()
     rich_output = use_rich_output(as_json=as_json, as_yaml=as_yaml, compact=compact)
+    next_cursor = None  # type: Optional[str]
     try:
         client = _get_client(config, quiet=not rich_output)
         if rich_output:
             console.print("🐦 Fetching tweet %s...\n" % tweet_id)
         start = time.time()
-        tweets = client.fetch_tweet_detail(tweet_id, _resolve_configured_count(config, max_count))
+        fetch_count = _resolve_configured_count(config, max_count)
+        try:
+            result = client.fetch_tweet_detail(
+                tweet_id, fetch_count, cursor=cursor, return_cursor=True
+            )
+        except TypeError:
+            result = (client.fetch_tweet_detail(tweet_id, fetch_count), None)
+        if isinstance(result, tuple) and len(result) == 2:
+            tweets, next_cursor = result
+        else:
+            tweets, next_cursor = result, None
         elapsed = time.time() - start
         if rich_output:
             console.print("✅ Fetched %d tweets in %.1fs\n" % (len(tweets), elapsed))
     except (TwitterError, RuntimeError) as exc:
         _exit_with_error(exc)
 
-    _emit_tweet_detail(tweets, compact=compact, as_json=as_json, as_yaml=as_yaml, full_text=full_text)
+    _emit_tweet_detail(
+        tweets, compact=compact, as_json=as_json, as_yaml=as_yaml, full_text=full_text, next_cursor=next_cursor
+    )
 
 
-def _emit_tweet_detail(tweets, compact, as_json, as_yaml, full_text):
-    # type: (list, bool, bool, bool, bool) -> None
+def _emit_tweet_detail(tweets, compact, as_json, as_yaml, full_text, next_cursor=None):
+    # type: (list, bool, bool, bool, bool, Optional[str]) -> None
     """Render tweet detail + replies in the requested output format."""
     if compact:
         click.echo(tweets_to_compact_json(tweets))
         return
 
-    if emit_structured(tweets_to_data(tweets), as_json=as_json, as_yaml=as_yaml):
+    if _emit_timeline_structured(tweets, next_cursor, as_json=as_json, as_yaml=as_yaml):
         return
 
     if tweets:

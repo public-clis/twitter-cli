@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from twitter_cli.models import Author, TweetMedia
 from twitter_cli.serialization import tweet_from_dict, tweet_to_dict, tweets_from_json, tweets_to_json
 
 
@@ -93,3 +94,71 @@ def test_tweet_roundtrip_preserves_promoted_flag(tweet_factory) -> None:
     assert payload["isPromoted"] is True
     restored = tweet_from_dict(payload)
     assert restored.is_promoted is True
+
+
+def test_tweet_roundtrip_preserves_rich_metadata(tweet_factory) -> None:
+    quoted = tweet_factory("101", possibly_sensitive=True)
+    tweet = tweet_factory(
+        "100",
+        author=Author(
+            id="u1",
+            name="Alice",
+            screen_name="alice",
+            followers_count=500,
+            following_count=120,
+            viewer_following=True,
+            viewer_followed_by=False,
+        ),
+        possibly_sensitive=True,
+        conversation_id="100",
+        in_reply_to_status_id="99",
+        in_reply_to_user_id="u0",
+        in_reply_to_screen_name="bob",
+        quoted_tweet=quoted,
+        media=[
+            TweetMedia(
+                type="video",
+                url="https://video.mp4",
+                width=1280,
+                height=720,
+                adult_content=True,
+                graphic_violence=True,
+                other_warning=False,
+                poster_url="https://thumb.jpg",
+                alt_text="clip",
+                duration_ms=4500,
+            )
+        ],
+    )
+    payload = tweet_to_dict(tweet)
+    assert payload["author"]["followers"] == 500
+    assert payload["author"]["following"] == 120
+    assert payload["author"]["viewerFollowing"] is True
+    assert payload["author"]["viewerFollowedBy"] is False
+    assert payload["possiblySensitive"] is True
+    assert payload["conversationId"] == "100"
+    assert payload["inReplyToStatusId"] == "99"
+    assert payload["inReplyToUserId"] == "u0"
+    assert payload["inReplyToScreenName"] == "bob"
+    assert payload["quotedTweet"]["possiblySensitive"] is True
+    assert payload["media"][0]["adultContent"] is True
+    assert payload["media"][0]["posterUrl"] == "https://thumb.jpg"
+    assert payload["media"][0]["altText"] == "clip"
+    assert payload["media"][0]["durationMs"] == 4500
+
+    restored = tweet_from_dict(payload)
+    assert restored.author.followers_count == 500
+    assert restored.author.following_count == 120
+    assert restored.author.viewer_following is True
+    assert restored.author.viewer_followed_by is False
+    assert restored.possibly_sensitive is True
+    assert restored.conversation_id == "100"
+    assert restored.in_reply_to_status_id == "99"
+    assert restored.in_reply_to_user_id == "u0"
+    assert restored.in_reply_to_screen_name == "bob"
+    assert restored.quoted_tweet is not None
+    assert restored.quoted_tweet.possibly_sensitive is True
+    assert restored.media[0].adult_content is True
+    assert restored.media[0].poster_url == "https://thumb.jpg"
+    assert restored.media[0].alt_text == "clip"
+    assert restored.media[0].duration_ms == 4500

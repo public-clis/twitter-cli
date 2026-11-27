@@ -198,9 +198,13 @@ class TwitterClient:
             return_cursor=return_cursor,
         )
 
-    def fetch_bookmarks(self, count=50):
-        # type: (int) -> List[Tweet]
-        """Fetch bookmarked tweets."""
+    def fetch_bookmarks(self, count=50, cursor=None, return_cursor=False):
+        # type: (int, Optional[str], bool) -> Any
+        """Fetch bookmarked tweets.
+
+        When ``return_cursor`` is True, returns ``(tweets, next_cursor)`` for
+        resumable batched pagination.
+        """
         def get_instructions(data):
             # type: (Any) -> Any
             instructions = _deep_get(data, "data", "bookmark_timeline", "timeline", "instructions")
@@ -208,7 +212,13 @@ class TwitterClient:
                 instructions = _deep_get(data, "data", "bookmark_timeline_v2", "timeline", "instructions")
             return instructions
 
-        return self._fetch_timeline("Bookmarks", count, get_instructions)
+        return self._fetch_timeline(
+            "Bookmarks",
+            count,
+            get_instructions,
+            start_cursor=cursor,
+            return_cursor=return_cursor,
+        )
 
     def fetch_bookmark_folders(self):
         # type: () -> List[BookmarkFolder]
@@ -274,51 +284,75 @@ class TwitterClient:
         profile = self.fetch_user(identifier)
         return profile.id
 
+    _USER_FEATURES = {
+        "hidden_profile_subscriptions_enabled": True,
+        "rweb_tipjar_consumption_enabled": True,
+        "responsive_web_graphql_exclude_directive_enabled": True,
+        "verified_phone_label_enabled": False,
+        "subscriptions_verification_info_is_identity_verified_enabled": True,
+        "subscriptions_verification_info_verified_since_enabled": True,
+        "highlights_tweets_tab_ui_enabled": True,
+        "responsive_web_twitter_article_notes_tab_enabled": True,
+        "subscriptions_feature_can_gift_premium": True,
+        "creator_subscriptions_tweet_preview_api_enabled": True,
+        "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+        "responsive_web_graphql_timeline_navigation_enabled": True,
+    }
+
+    def fetch_user_by_id(self, user_id):
+        # type: (str) -> UserProfile
+        """Fetch user profile by numeric user ID (UserByRestId)."""
+        variables = {
+            "userId": user_id,
+            "withSafetyModeUserFields": True,
+        }
+        data = self._graphql_get("UserByRestId", variables, self._USER_FEATURES)
+        result = _deep_get(data, "data", "user", "result")
+        profile = parse_user_result(result) if isinstance(result, dict) else None
+        if not profile:
+            raise NotFoundError("User %s not found" % user_id)
+        return profile
+
     def fetch_user(self, screen_name):
         # type: (str) -> UserProfile
-        """Fetch user profile by screen name."""
+        """Fetch user profile by screen name or numeric user ID."""
+        if screen_name.isdigit():
+            return self.fetch_user_by_id(screen_name)
         variables = {
             "screen_name": screen_name,
             "withSafetyModeUserFields": True,
         }
-        features = {
-            "hidden_profile_subscriptions_enabled": True,
-            "rweb_tipjar_consumption_enabled": True,
-            "responsive_web_graphql_exclude_directive_enabled": True,
-            "verified_phone_label_enabled": False,
-            "subscriptions_verification_info_is_identity_verified_enabled": True,
-            "subscriptions_verification_info_verified_since_enabled": True,
-            "highlights_tweets_tab_ui_enabled": True,
-            "responsive_web_twitter_article_notes_tab_enabled": True,
-            "subscriptions_feature_can_gift_premium": True,
-            "creator_subscriptions_tweet_preview_api_enabled": True,
-            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-            "responsive_web_graphql_timeline_navigation_enabled": True,
-        }
-        data = self._graphql_get("UserByScreenName", variables, features)
+        data = self._graphql_get("UserByScreenName", variables, self._USER_FEATURES)
         result = _deep_get(data, "data", "user", "result")
-        if not result:
+        if not isinstance(result, dict):
             raise NotFoundError("User @%s not found" % screen_name)
 
-        legacy = result.get("legacy", {})
-        core = result.get("core", {})
-        avatar = result.get("avatar", {})
-        location_obj = result.get("location", {})
-        return UserProfile(
-            id=result.get("rest_id", ""),
-            name=core.get("name") or legacy.get("name", ""),
-            screen_name=core.get("screen_name") or legacy.get("screen_name", screen_name),
-            bio=legacy.get("description", ""),
-            location=location_obj.get("location") or legacy.get("location", ""),
-            url=_deep_get(legacy, "entities", "url", "urls", 0, "expanded_url") or "",
-            followers_count=_parse_int(legacy.get("followers_count"), 0),
-            following_count=_parse_int(legacy.get("friends_count"), 0),
-            tweets_count=_parse_int(legacy.get("statuses_count"), 0),
-            likes_count=_parse_int(legacy.get("favourites_count"), 0),
-            verified=bool(result.get("is_blue_verified") or legacy.get("verified", False)),
-            profile_image_url=avatar.get("image_url") or legacy.get("profile_image_url_https", ""),
-            created_at=core.get("created_at") or legacy.get("created_at", ""),
-        )
+        profile = parse_user_result(result)
+        if profile is None:
+            if result.get("__typename") == "UserUnavailable" or not result:
+                raise NotFoundError("User @%s not found" % screen_name)
+            legacy = result.get("legacy") or {}
+            core = result.get("core") or {}
+            avatar = result.get("avatar") or {}
+            location_obj = result.get("location") or {}
+            return UserProfile(
+                id=result.get("rest_id", ""),
+                name=core.get("name") or legacy.get("name", ""),
+                screen_name=core.get("screen_name") or legacy.get("screen_name", screen_name),
+                bio=legacy.get("description", ""),
+                location=location_obj.get("location") or legacy.get("location", ""),
+                url=_deep_get(legacy, "entities", "url", "urls", 0, "expanded_url") or "",
+                followers_count=_parse_int(legacy.get("followers_count"), 0),
+                following_count=_parse_int(legacy.get("friends_count"), 0),
+                tweets_count=_parse_int(legacy.get("statuses_count"), 0),
+                likes_count=_parse_int(legacy.get("favourites_count"), 0),
+                verified=bool(result.get("is_blue_verified") or legacy.get("verified", False)),
+                profile_image_url=avatar.get("image_url") or legacy.get("profile_image_url_https", ""),
+                created_at=core.get("created_at") or legacy.get("created_at", ""),
+            )
+        if not profile.screen_name:
+            profile.screen_name = screen_name
+        return profile
 
     def fetch_user_tweets(self, user_id, count=20):
         # type: (str, int) -> List[Tweet]
@@ -391,10 +425,15 @@ class TwitterClient:
             use_post=True,
         )
 
-    def fetch_tweet_detail(self, tweet_id, count=20):
-        # type: (str, int) -> List[Tweet]
-        """Fetch a tweet and its conversation thread (replies)."""
-        return self._fetch_timeline(
+    def fetch_tweet_detail(self, tweet_id, count=20, cursor=None, return_cursor=False):
+        # type: (str, int, Optional[str], bool) -> Any
+        """Fetch a tweet and its conversation thread (replies).
+
+        When ``cursor`` is None, verifies that the focal tweet is present in
+        the response (raising NotFoundError instead of silently returning empty
+        or reply-only results) and places it first.
+        """
+        result = self._fetch_timeline(
             "TweetDetail",
             count,
             lambda data: _deep_get(data, "data", "tweetResult", "result", "timeline", "instructions")
@@ -417,7 +456,25 @@ class TwitterClient:
                 "withGrokAnalyze": False,
                 "withDisallowedReplyControls": False,
             },
+            start_cursor=cursor,
+            return_cursor=return_cursor,
         )
+        if return_cursor:
+            tweets, next_cursor = result
+        else:
+            tweets, next_cursor = result, None
+
+        if cursor is None:
+            focal_tweet = next((tweet for tweet in tweets if tweet.id == tweet_id), None)
+            if focal_tweet is None:
+                raise NotFoundError(
+                    "Tweet %s was not returned by the TweetDetail response" % tweet_id
+                )
+            tweets = [focal_tweet] + [tweet for tweet in tweets if tweet.id != tweet_id]
+
+        if return_cursor:
+            return tweets, next_cursor
+        return tweets
 
     def fetch_article(self, tweet_id):
         # type: (str) -> Tweet

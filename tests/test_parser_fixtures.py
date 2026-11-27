@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from twitter_cli.client import TwitterClient
-from twitter_cli.parser import _deep_get, parse_timeline_response
+from twitter_cli.parser import _deep_get, _extract_media, parse_timeline_response, parse_user_result
 
 
 def _make_client() -> TwitterClient:
@@ -107,3 +107,106 @@ def test_fetch_user_list_with_fixture(monkeypatch, fixture_loader) -> None:
     assert len(users) == 1
     assert users[0].screen_name == "follower1"
     assert users[0].verified is True
+
+
+def test_parse_sensitive_media_and_thread_metadata(fixture_loader) -> None:
+    payload = fixture_loader("home_timeline.json")
+    entry = payload["data"]["home"]["home_timeline_urt"]["instructions"][0]["entries"][0]
+    tweet_res = entry["content"]["itemContent"]["tweet_results"]["result"]
+    legacy = tweet_res["legacy"]
+    legacy["possibly_sensitive"] = True
+    legacy["conversation_id_str"] = "1"
+    legacy["in_reply_to_status_id_str"] = "999"
+    legacy["in_reply_to_user_id_str"] = "42"
+    legacy["in_reply_to_screen_name"] = "parent_user"
+    legacy["extended_entities"]["media"][0]["ext_sensitive_media_warning"] = {
+        "adult_content": True,
+        "graphic_violence": False,
+        "other": False,
+    }
+    legacy["extended_entities"]["media"][0]["ext_alt_text"] = "A cat"
+    user_legacy = tweet_res["core"]["user_results"]["result"]["legacy"]
+    user_legacy["followers_count"] = 1234
+    user_legacy["friends_count"] = 56
+    user_legacy["following"] = True
+    user_legacy["followed_by"] = False
+
+    tweets, _ = parse_timeline_response(
+        payload,
+        lambda data: _deep_get(data, "data", "home", "home_timeline_urt", "instructions"),
+    )
+
+    t = tweets[0]
+    assert t.possibly_sensitive is True
+    assert t.conversation_id == "1"
+    assert t.in_reply_to_status_id == "999"
+    assert t.in_reply_to_user_id == "42"
+    assert t.in_reply_to_screen_name == "parent_user"
+    assert t.media[0].adult_content is True
+    assert t.media[0].graphic_violence is False
+    assert t.media[0].alt_text == "A cat"
+    assert t.author.followers_count == 1234
+    assert t.author.following_count == 56
+    assert t.author.viewer_following is True
+    assert t.author.viewer_followed_by is False
+
+
+def test_extract_media_reads_nested_warning_and_video_poster() -> None:
+    legacy = {
+        "extended_entities": {
+            "media": [
+                {
+                    "type": "video",
+                    "media_url_https": "https://pbs.twimg.com/thumb.jpg",
+                    "original_info": {"width": 1280, "height": 720},
+                    "video_info": {
+                        "duration_millis": 15000,
+                        "variants": [
+                            {"content_type": "video/mp4", "bitrate": 832000, "url": "https://v.mp4"}
+                        ],
+                    },
+                    "media_results": {
+                        "result": {
+                            "sensitive_media_warning": {"graphic_violence": True}
+                        }
+                    },
+                }
+            ]
+        }
+    }
+    media = _extract_media(legacy)
+    assert len(media) == 1
+    assert media[0].url == "https://v.mp4"
+    assert media[0].poster_url == "https://pbs.twimg.com/thumb.jpg"
+    assert media[0].duration_ms == 15000
+    assert media[0].graphic_violence is True
+    assert media[0].adult_content is False
+
+
+def test_parse_user_result_handles_post_legacy_user_by_rest_id_shape() -> None:
+    user_data = {
+        "rest_id": "44196397",
+        "core": {"name": "Elon Musk", "screen_name": "elonmusk", "created_at": "Tue Jun 02 20:12:29 +0000 2009"},
+        "avatar": {"image_url": "https://pbs.twimg.com/avatar.jpg"},
+        "location": {"location": "Mars"},
+        "profile_bio": {"description": "Builder"},
+        "website": {"url": "https://x.com"},
+        "relationship_counts": {"followers": 200000000, "following": 800},
+        "tweet_counts": {"tweets": 50000},
+        "action_counts": {"favorites_count": 90000},
+        "relationship_perspectives": {"following": True, "followed_by": False},
+        "verification": {"verified": True},
+    }
+    profile = parse_user_result(user_data)
+    assert profile is not None
+    assert profile.id == "44196397"
+    assert profile.screen_name == "elonmusk"
+    assert profile.bio == "Builder"
+    assert profile.url == "https://x.com"
+    assert profile.followers_count == 200000000
+    assert profile.following_count == 800
+    assert profile.tweets_count == 50000
+    assert profile.likes_count == 90000
+    assert profile.verified is True
+    assert profile.viewer_following is True
+    assert profile.viewer_followed_by is False

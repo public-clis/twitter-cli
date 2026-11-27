@@ -868,3 +868,82 @@ def test_show_malformed_cache_treated_as_empty(monkeypatch, tmp_path):
     result = runner.invoke(cli, ["show", "1"])
     assert result.exit_code != 0
     assert "No cached results" in result.output
+
+
+def test_cli_tweet_reports_missing_focal_tweet_as_structured_error(monkeypatch) -> None:
+    from twitter_cli.exceptions import NotFoundError
+
+    class FakeClient:
+        def fetch_tweet_detail(self, tweet_id: str, max_count: int, cursor=None, return_cursor=False):
+            raise NotFoundError("Tweet %s was not returned by the TweetDetail response" % tweet_id)
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 50}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["tweet", "12345", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "not_found"
+    assert "TweetDetail response" in payload["error"]["message"]
+
+
+def test_cli_tweet_emits_pagination_cursor_and_thread_fields(monkeypatch, tweet_factory) -> None:
+    captured = {}
+
+    class FakeClient:
+        def fetch_tweet_detail(self, tweet_id: str, max_count: int, cursor=None, return_cursor=False):
+            captured["cursor"] = cursor
+            captured["return_cursor"] = return_cursor
+            return [
+                tweet_factory("100", conversation_id="100"),
+                tweet_factory("101", conversation_id="100", in_reply_to_status_id="100", in_reply_to_screen_name="alice"),
+            ], "cursor-replies-2"
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 50}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["tweet", "100", "--cursor", "cursor-1", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["pagination"]["nextCursor"] == "cursor-replies-2"
+    assert payload["data"][1]["conversationId"] == "100"
+    assert payload["data"][1]["inReplyToStatusId"] == "100"
+    assert captured == {"cursor": "cursor-1", "return_cursor": True}
+
+
+def test_cli_bookmarks_cursor_pagination(monkeypatch, tweet_factory) -> None:
+    captured = {}
+
+    class FakeClient:
+        def fetch_bookmarks(self, count: int, cursor=None, return_cursor=False):
+            captured["cursor"] = cursor
+            captured["return_cursor"] = return_cursor
+            return [tweet_factory("77")], "bm-cursor-2"
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 20}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["bookmarks", "--cursor", "bm-cursor-1", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"][0]["id"] == "77"
+    assert payload["pagination"]["nextCursor"] == "bm-cursor-2"
+    assert captured == {"cursor": "bm-cursor-1", "return_cursor": True}
