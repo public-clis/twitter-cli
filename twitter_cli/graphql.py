@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 from .cache import _open_owner_only, _tighten_dir
 from .exceptions import QueryIdError
+from .text import CREATE_NOTE_TWEET_OPERATION, CREATE_TWEET_OPERATION
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,8 @@ FALLBACK_QUERY_IDS = {
     "ListLatestTweetsTimeline": "UMc_lPEeKz_WiKSY8ZT7yw",
     "Followers": "Xe3y9_ndZ9-RtWz8zd_wpg",
     "Following": "eDqlbOS46zda8jDT8dEQ_Q",
-    "CreateTweet": "wR5Z_lEibLvkew3tF9w-Sg",
+    CREATE_TWEET_OPERATION: "wR5Z_lEibLvkew3tF9w-Sg",
+    CREATE_NOTE_TWEET_OPERATION: "_eeuQKX1-VyRP_ROM-GN7g",
     "DeleteTweet": "nxpZCY2K-I6QoFHAHeojFQ",
     "FavoriteTweet": "lI07N6Otwv1PhnEgXILM7A",
     "UnfavoriteTweet": "ZYKSe-w7KEslx3JhSIk5LA",
@@ -59,6 +61,10 @@ FALLBACK_QUERY_IDS = {
     "TweetResultByRestId": "U8lc5aomF5krJzZ9vJ9wxg",
     "BookmarkFoldersSlice": "i78YDd0Tza-dV4SYs58kRg",
     "BookmarkFolderTimeline": "hNY7X2xE2N7HVF6Qb_mu6w",
+    "ArticleEntityDraftCreate": "g1l5N8BxGewYuCy5USe_bQ",
+    "ArticleEntityUpdateTitle": "x75E2ABzm8_mGTg1bz8hcA",
+    "ArticleEntityUpdateContent": "M7N2FrPrlOmu-YrVIBxFnQ",
+    "ArticleEntityPublish": "m4SHicYMoWO_qkLvjhDk7Q",
 }
 
 # ── Default feature flags ────────────────────────────────────────────────
@@ -87,6 +93,32 @@ _DEFAULT_FEATURES = {
 
 # Features dict that gets updated dynamically from x.com JS bundles
 FEATURES = dict(_DEFAULT_FEATURES)
+
+# Extra composer flags scoped to CreateNoteTweet
+NOTE_TWEET_FEATURES = {
+    "longform_notetweets_creation_enabled": True,
+    "longform_notetweets_richtext_consumption_enabled": True,
+    "articles_preview_enabled": True,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+}
+
+# Feature flags scoped to X Article authoring mutations
+ARTICLE_FEATURES = {
+    "profile_label_improvements_pcf_label_in_post_enabled": True,
+    "responsive_web_profile_redirect_enabled": False,
+    "rweb_tipjar_consumption_enabled": False,
+    "verified_phone_label_enabled": False,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+}
+
+
+def operation_features(operation_name):
+    # type: (str) -> Dict[str, Any]
+    """Return base features plus overrides scoped to one operation."""
+    if operation_name == CREATE_NOTE_TWEET_OPERATION:
+        return dict(FEATURES, **NOTE_TWEET_FEATURES)
+    return FEATURES
 
 # Module-level caches (not thread-safe — CLI is single-threaded)
 _cached_query_ids: Dict[str, str] = {}

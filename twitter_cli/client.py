@@ -44,11 +44,13 @@ from .exceptions import (
     TwitterAPIError,
 )
 from .graphql import (
+    ARTICLE_FEATURES,
     FEATURES,
     _build_graphql_url,
     _invalidate_query_id,
     _resolve_query_id,
     _update_features_from_html,
+    operation_features,
 )
 from .models import BookmarkFolder, UserProfile
 from .parser import (
@@ -58,6 +60,7 @@ from .parser import (
     parse_tweet_result,
     parse_user_result,
 )
+from .text import CREATE_NOTE_TWEET_OPERATION, tweet_create_route
 
 if TYPE_CHECKING:
     from typing import Dict, List, Optional, Set, Tuple  # noqa: F401
@@ -304,6 +307,29 @@ def _normalize_explore_items(instructions, count=20):
         if len(stories) >= count:
             break
     return stories
+
+
+def _prepare_tweet_create(text, variables):
+    # type: (str, Dict[str, Any]) -> Tuple[str, Dict[str, Any]]
+    """Apply operation-specific variables and return its feature set."""
+    operation_name, weighted_length = tweet_create_route(text)
+    if operation_name == CREATE_NOTE_TWEET_OPERATION:
+        variables["disallowed_reply_options"] = None
+        logger.info(
+            "Tweet weighted=%d, using CreateNoteTweet (long-form)",
+            weighted_length,
+        )
+    return operation_name, operation_features(operation_name)
+
+
+def _created_tweet_result(data):
+    # type: (Dict[str, Any]) -> Optional[Dict[str, Any]]
+    """Extract tweet result from CreateTweet or CreateNoteTweet responses."""
+    return (
+        _deep_get(data, "data", "create_tweet", "tweet_results", "result")
+        or _deep_get(data, "data", "notetweet_create", "tweet_results", "result")
+        or _deep_get(data, "data", "create_note_tweet", "tweet_results", "result")
+    )
 
 
 # ── TwitterClient ────────────────────────────────────────────────────────
@@ -703,6 +729,84 @@ class TwitterClient:
         logger.info("fetch_article: tweet_id=%s", tweet_id)
         return tweet
 
+    def create_article(self, title, content_state, publish=True):
+        # type: (str, Dict[str, Any], bool) -> Dict[str, Any]
+        """Create an X Article draft, optionally publish it, and return metadata."""
+        if not title.strip():
+            raise TwitterAPIError(0, "Article title is required")
+
+        article_id = self._create_article_draft()
+        self._update_article_title(article_id, title)
+        self._update_article_content(article_id, content_state)
+        if publish:
+            article_id = self._publish_article(article_id)
+            url = "https://x.com/i/article/%s" % article_id
+        else:
+            url = "https://x.com/compose/article/edit/%s" % article_id
+
+        self._write_delay()
+        return {
+            "id": article_id,
+            "title": title,
+            "url": url,
+            "published": bool(publish),
+        }
+
+    def _create_article_draft(self):
+        # type: () -> str
+        variables = {
+            "content_state": {"blocks": [], "entity_map": []},
+            "title": "",
+        }
+        data = self._graphql_post("ArticleEntityDraftCreate", variables, ARTICLE_FEATURES)
+        result = _deep_get(
+            data,
+            "data",
+            "articleentity_create_draft",
+            "article_entity_results",
+            "result",
+        )
+        if result and result.get("rest_id"):
+            return result["rest_id"]
+        raise TwitterAPIError(0, "Failed to create article draft")
+
+    def _update_article_title(self, article_id, title):
+        # type: (str, str) -> None
+        variables = {
+            "articleEntityId": article_id,
+            "title": title,
+        }
+        self._graphql_post("ArticleEntityUpdateTitle", variables, ARTICLE_FEATURES)
+
+    def _update_article_content(self, article_id, content_state):
+        # type: (str, Dict[str, Any]) -> None
+        variables = {
+            "content_state": {
+                "blocks": content_state.get("blocks") or [],
+                "entity_map": content_state.get("entity_map") or [],
+            },
+            "article_entity": article_id,
+        }
+        self._graphql_post("ArticleEntityUpdateContent", variables, ARTICLE_FEATURES)
+
+    def _publish_article(self, article_id):
+        # type: (str) -> str
+        variables = {
+            "articleEntityId": article_id,
+            "visibilitySetting": "Public",
+        }
+        data = self._graphql_post("ArticleEntityPublish", variables, ARTICLE_FEATURES)
+        result = _deep_get(
+            data,
+            "data",
+            "articleentity_publish",
+            "article_entity_results",
+            "result",
+        )
+        if result and result.get("rest_id"):
+            return result["rest_id"]
+        raise TwitterAPIError(0, "Failed to publish article")
+
     def fetch_list_timeline(self, list_id, count=20, cursor=None, return_cursor=False):
         # type: (str, int, Optional[str], bool) -> Any
         """Fetch tweets from a Twitter List."""
@@ -736,9 +840,12 @@ class TwitterClient:
 
     # ── Write operations ─────────────────────────────────────────────
 
-    # Supported image MIME types and max file size (5 MB)
+    # Supported image MIME types and max file sizes
     _SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
     _MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5 MB
+    _MAX_VIDEO_SIZE = 512 * 1024 * 1024  # 512 MB (X hard cap for tweet_video)
+    _VIDEO_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB per APPEND segment
+    _VIDEO_PROCESS_TIMEOUT = 300  # seconds to wait for async video processing
 
     def _write_delay(self):
         # type: () -> None
@@ -749,26 +856,37 @@ class TwitterClient:
 
     def upload_media(self, file_path):
         # type: (str) -> str
-        """Upload an image file to Twitter.  Returns the media_id string.
+        """Upload an image or video file to Twitter.  Returns the media_id string.
 
-        Uses Twitter's chunked upload API (INIT → APPEND → FINALIZE).
-        Supports JPEG, PNG, GIF, and WebP images up to 5 MB.
+        Uses Twitter's chunked upload API (INIT → APPEND → FINALIZE [+ STATUS for video]).
+        Images: JPEG, PNG, GIF, WebP up to 5 MB.
+        Videos (mp4/mov/webm): up to 512 MB, uploaded in 4 MB chunks with async STATUS polling.
         """
         if not os.path.isfile(file_path):
             raise MediaUploadError("File not found: %s" % file_path)
 
         file_size = os.path.getsize(file_path)
-        if file_size > self._MAX_IMAGE_SIZE:
-            raise MediaUploadError(
-                "File too large: %.1f MB (max %.0f MB)"
-                % (file_size / (1024 * 1024), self._MAX_IMAGE_SIZE / (1024 * 1024))
-            )
-
         media_type = mimetypes.guess_type(file_path)[0] or ""
-        if media_type not in self._SUPPORTED_IMAGE_TYPES:
-            raise MediaUploadError(
-                "Unsupported image format: %s (supported: jpeg, png, gif, webp)" % media_type
-            )
+        is_video = media_type.startswith("video/")
+
+        if is_video:
+            if file_size > self._MAX_VIDEO_SIZE:
+                raise MediaUploadError(
+                    "File too large: %.1f MB (max %.0f MB)"
+                    % (file_size / (1024 * 1024), self._MAX_VIDEO_SIZE / (1024 * 1024))
+                )
+            media_category = "tweet_video"
+        else:
+            if file_size > self._MAX_IMAGE_SIZE:
+                raise MediaUploadError(
+                    "File too large: %.1f MB (max %.0f MB)"
+                    % (file_size / (1024 * 1024), self._MAX_IMAGE_SIZE / (1024 * 1024))
+                )
+            if media_type not in self._SUPPORTED_IMAGE_TYPES:
+                raise MediaUploadError(
+                    "Unsupported image format: %s (supported: jpeg, png, gif, webp)" % media_type
+                )
+            media_category = "tweet_image"
 
         upload_url = "https://upload.twitter.com/i/media/upload.json"
         session = _get_cffi_session()
@@ -780,6 +898,7 @@ class TwitterClient:
             "command": "INIT",
             "total_bytes": str(file_size),
             "media_type": media_type,
+            "media_category": media_category,
         }
         resp = session.post(upload_url, headers=headers, data=init_data, timeout=30)
         if resp.status_code >= 400:
@@ -791,25 +910,39 @@ class TwitterClient:
         media_id = init_result.get("media_id_string", "")
         if not media_id:
             raise MediaUploadError("INIT did not return media_id")
-        logger.info("Media INIT: media_id=%s", media_id)
+        logger.info("Media INIT: media_id=%s category=%s", media_id, media_category)
 
         # ── APPEND ───────────────────────────────────────────────────
+        segment_index = 0
         with open(file_path, "rb") as f:
-            media_data = base64.b64encode(f.read()).decode("ascii")
-
-        headers = self._build_headers(url=upload_url, method="POST")
-        # Remove JSON content-type — curl_cffi handles multipart encoding
-        headers.pop("Content-Type", None)
-        append_data = {
-            "command": "APPEND",
-            "media_id": media_id,
-            "segment_index": "0",
-            "media_data": media_data,
-        }
-        resp = session.post(upload_url, headers=headers, data=append_data, timeout=60)
-        if resp.status_code >= 400:
-            raise MediaUploadError("APPEND failed (HTTP %d): %s" % (resp.status_code, resp.text[:300]))
-        logger.info("Media APPEND: segment 0 uploaded")
+            while True:
+                media_bytes = f.read(self._VIDEO_CHUNK_SIZE if is_video else None)
+                if not media_bytes:
+                    if segment_index == 0 and not is_video:
+                        media_bytes = b""
+                    else:
+                        break
+                media_data = base64.b64encode(media_bytes).decode("ascii")
+                headers = self._build_headers(url=upload_url, method="POST")
+                headers.pop("Content-Type", None)
+                append_data = {
+                    "command": "APPEND",
+                    "media_id": media_id,
+                    "segment_index": str(segment_index),
+                    "media_data": media_data,
+                }
+                resp = session.post(
+                    upload_url, headers=headers, data=append_data, timeout=300 if is_video else 60
+                )
+                if resp.status_code >= 400:
+                    raise MediaUploadError(
+                        "APPEND segment %d failed (HTTP %d): %s"
+                        % (segment_index, resp.status_code, resp.text[:300])
+                    )
+                logger.info("Media APPEND: segment %d uploaded", segment_index)
+                segment_index += 1
+                if not is_video:
+                    break
 
         # ── FINALIZE ─────────────────────────────────────────────────
         headers = self._build_headers(url=upload_url, method="POST")
@@ -823,16 +956,52 @@ class TwitterClient:
             raise MediaUploadError("FINALIZE failed (HTTP %d): %s" % (resp.status_code, resp.text[:300]))
         logger.info("Media FINALIZE: media_id=%s ready", media_id)
 
+        # ── STATUS (videos only) ─────────────────────────────────────
+        if is_video:
+            try:
+                finalize_result = json.loads(resp.text)
+            except (json.JSONDecodeError, ValueError):
+                finalize_result = {}
+            info = finalize_result.get("processing_info") if isinstance(finalize_result, dict) else None
+            deadline = time.time() + self._VIDEO_PROCESS_TIMEOUT
+            while isinstance(info, dict) and info.get("state") not in (None, "succeeded"):
+                state = info.get("state")
+                if state == "failed":
+                    raise MediaUploadError(
+                        "Video processing failed: %s" % json.dumps(info.get("error", info))
+                    )
+                wait = max(1, int(info.get("check_after_secs", 3)))
+                time.sleep(wait)
+                if time.time() > deadline:
+                    raise MediaUploadError(
+                        "Video processing timed out after %ds" % self._VIDEO_PROCESS_TIMEOUT
+                    )
+                headers = self._build_headers(url=upload_url, method="GET")
+                resp = session.get(
+                    upload_url,
+                    headers=headers,
+                    params={"command": "STATUS", "media_id": media_id},
+                    timeout=30,
+                )
+                if resp.status_code >= 400:
+                    raise MediaUploadError(
+                        "STATUS failed (HTTP %d): %s" % (resp.status_code, resp.text[:300])
+                    )
+                try:
+                    status_result = json.loads(resp.text)
+                except (json.JSONDecodeError, ValueError):
+                    raise MediaUploadError("STATUS returned invalid JSON")
+                info = status_result.get("processing_info") if isinstance(status_result, dict) else None
+            logger.info("Media STATUS: video processing complete")
+
         return media_id
 
     def create_tweet(self, text, reply_to_id=None, media_ids=None):
         # type: (str, Optional[str], Optional[List[str]]) -> str
         """Post a new tweet.  Returns the new tweet ID.
 
-        Args:
-            text: Tweet text content.
-            reply_to_id: Optional tweet ID to reply to.
-            media_ids: Optional list of media IDs (from upload_media) to attach.
+        Posts exceeding 280 weighted characters automatically route through
+        CreateNoteTweet for X Premium long-form posts.
         """
         media_entities = []
         if media_ids:
@@ -842,18 +1011,20 @@ class TwitterClient:
             "media": {"media_entities": media_entities, "possibly_sensitive": False},
             "semantic_annotation_ids": [],
             "dark_request": False,
+            "includePromotedContent": False,
         }  # type: Dict[str, Any]
         if reply_to_id:
             variables["reply"] = {
                 "in_reply_to_tweet_id": reply_to_id,
                 "exclude_reply_user_ids": [],
             }
-        data = self._graphql_post("CreateTweet", variables, FEATURES)
+        operation_name, features = _prepare_tweet_create(text, variables)
+        data = self._graphql_post(operation_name, variables, features)
         self._write_delay()
-        result = _deep_get(data, "data", "create_tweet", "tweet_results", "result")
+        result = _created_tweet_result(data)
         if result:
             return result.get("rest_id", "")
-        raise TwitterAPIError(0, "Failed to create tweet")
+        raise TwitterAPIError(0, "Failed to create tweet (op=%s)" % operation_name)
 
     def delete_tweet(self, tweet_id):
         # type: (str) -> bool
@@ -977,13 +1148,15 @@ class TwitterClient:
             "media": {"media_entities": media_entities, "possibly_sensitive": False},
             "semantic_annotation_ids": [],
             "dark_request": False,
+            "includePromotedContent": False,
         }
-        data = self._graphql_post("CreateTweet", variables, FEATURES)
+        operation_name, features = _prepare_tweet_create(text, variables)
+        data = self._graphql_post(operation_name, variables, features)
         self._write_delay()
-        result = _deep_get(data, "data", "create_tweet", "tweet_results", "result")
+        result = _created_tweet_result(data)
         if result:
             return result.get("rest_id", "")
-        raise TwitterAPIError(0, "Failed to create quote tweet")
+        raise TwitterAPIError(0, "Failed to create quote tweet (op=%s)" % operation_name)
 
     def follow_user(self, user_id):
         # type: (str) -> bool

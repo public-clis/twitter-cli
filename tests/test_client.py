@@ -1982,3 +1982,217 @@ class TestFetchExploreNews:
                 "type": "TimelineTrend",
             }
         ]
+
+
+class TestCreateLongFormTweet:
+    @staticmethod
+    def _make_client():
+        client = TwitterClient.__new__(TwitterClient)
+        client._write_delay = lambda: None
+        return client
+
+    def test_standard_tweet_uses_create_tweet(self):
+        from twitter_cli.graphql import NOTE_TWEET_FEATURES
+
+        client = self._make_client()
+        calls = []
+
+        def mock_graphql_post(operation_name, variables, features=None):
+            calls.append((operation_name, variables, features))
+            return {"data": {"create_tweet": {"tweet_results": {"result": {"rest_id": "88"}}}}}
+
+        client._graphql_post = mock_graphql_post
+
+        assert client.create_tweet("x" * 280) == "88"
+        op, variables, features = calls[0]
+        assert op == "CreateTweet"
+        assert "disallowed_reply_options" not in variables
+        assert features is FEATURES
+        assert NOTE_TWEET_FEATURES.keys().isdisjoint(features)
+
+    def test_long_tweet_uses_create_note_tweet(self):
+        from twitter_cli.graphql import NOTE_TWEET_FEATURES
+
+        client = self._make_client()
+        calls = []
+
+        def mock_graphql_post(operation_name, variables, features=None):
+            calls.append((operation_name, variables, features))
+            return {
+                "data": {"notetweet_create": {"tweet_results": {"result": {"rest_id": "99"}}}}
+            }
+
+        client._graphql_post = mock_graphql_post
+
+        assert client.create_tweet("x" * 281, reply_to_id="123") == "99"
+        op, variables, features = calls[0]
+        assert op == "CreateNoteTweet"
+        assert variables["disallowed_reply_options"] is None
+        assert variables["reply"]["in_reply_to_tweet_id"] == "123"
+        assert features == dict(FEATURES, **NOTE_TWEET_FEATURES)
+
+    def test_long_quote_uses_create_note_tweet(self):
+        from twitter_cli.graphql import NOTE_TWEET_FEATURES
+
+        client = self._make_client()
+        calls = []
+
+        def mock_graphql_post(operation_name, variables, features=None):
+            calls.append((operation_name, variables, features))
+            return {
+                "data": {"notetweet_create": {"tweet_results": {"result": {"rest_id": "100"}}}}
+            }
+
+        client._graphql_post = mock_graphql_post
+
+        assert client.quote_tweet("456", "x" * 281) == "100"
+        op, variables, features = calls[0]
+        assert op == "CreateNoteTweet"
+        assert variables["attachment_url"] == "https://x.com/i/status/456"
+        assert features == dict(FEATURES, **NOTE_TWEET_FEATURES)
+
+
+class TestUploadVideo:
+    def _make_client(self):
+        client = TwitterClient.__new__(TwitterClient)
+        client._auth_token = "tok"
+        client._ct0 = "ct0"
+        client._cookie_string = None
+        client._client_transaction = MagicMock()
+        client._client_transaction.generate_transaction_id.return_value = "tid-video"
+        client._ct_init_attempted = True
+        return client
+
+    @patch("twitter_cli.client.time.sleep")
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_upload_video_chunks_and_polls_status(self, mock_session, _mock_sleep, tmp_path):
+        vid = tmp_path / "clip.mp4"
+        # 5 MB -> 2 chunks (4 MB + 1 MB)
+        vid.write_bytes(b"\x00" * (5 * 1024 * 1024))
+
+        resp_init = MagicMock(status_code=200, text='{"media_id_string": "vid-999"}')
+        resp_append0 = MagicMock(status_code=204, text="")
+        resp_append1 = MagicMock(status_code=204, text="")
+        resp_finalize = MagicMock(
+            status_code=200,
+            text='{"media_id_string": "vid-999", "processing_info": {"state": "pending", "check_after_secs": 1}}',
+        )
+        resp_status = MagicMock(
+            status_code=200,
+            text='{"media_id_string": "vid-999", "processing_info": {"state": "succeeded"}}',
+        )
+
+        sess = MagicMock()
+        sess.post = MagicMock(side_effect=[resp_init, resp_append0, resp_append1, resp_finalize])
+        sess.get = MagicMock(return_value=resp_status)
+        mock_session.return_value = sess
+
+        client = self._make_client()
+        media_id = client.upload_media(str(vid))
+
+        assert media_id == "vid-999"
+        assert sess.post.call_count == 4
+        assert sess.post.call_args_list[0].kwargs["data"]["media_category"] == "tweet_video"
+        assert sess.get.call_count == 1
+
+    @patch("twitter_cli.client.time.sleep")
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_upload_video_raises_on_failed_processing(self, mock_session, _mock_sleep, tmp_path):
+        from twitter_cli.exceptions import MediaUploadError
+
+        vid = tmp_path / "bad.mp4"
+        vid.write_bytes(b"\x00" * 100)
+
+        sess = MagicMock()
+        sess.post = MagicMock(
+            side_effect=[
+                MagicMock(status_code=200, text='{"media_id_string": "vid-1"}'),
+                MagicMock(status_code=204, text=""),
+                MagicMock(
+                    status_code=200,
+                    text='{"processing_info": {"state": "failed", "error": {"message": "bad codec"}}}',
+                ),
+            ]
+        )
+        mock_session.return_value = sess
+
+        client = self._make_client()
+        with pytest.raises(MediaUploadError, match="Video processing failed"):
+            client.upload_media(str(vid))
+
+
+class TestCreateArticle:
+    def _make_client(self):
+        client = TwitterClient.__new__(TwitterClient)
+        client._write_delay = lambda: None
+        return client
+
+    def test_create_article_publishes_draft_with_content(self):
+        client = self._make_client()
+        calls = []
+
+        def mock_graphql_post(operation_name, variables, features=None):
+            calls.append((operation_name, variables))
+            if operation_name == "ArticleEntityDraftCreate":
+                return {
+                    "data": {
+                        "articleentity_create_draft": {
+                            "article_entity_results": {"result": {"rest_id": "draft-1"}}
+                        }
+                    }
+                }
+            if operation_name == "ArticleEntityPublish":
+                return {
+                    "data": {
+                        "articleentity_publish": {
+                            "article_entity_results": {"result": {"rest_id": "article-1"}}
+                        }
+                    }
+                }
+            return {"data": {}}
+
+        client._graphql_post = mock_graphql_post
+        result = client.create_article(
+            "Title", {"blocks": [{"text": "Body"}], "entity_map": []}, publish=True
+        )
+
+        assert result == {
+            "id": "article-1",
+            "title": "Title",
+            "url": "https://x.com/i/article/article-1",
+            "published": True,
+        }
+        assert [c[0] for c in calls] == [
+            "ArticleEntityDraftCreate",
+            "ArticleEntityUpdateTitle",
+            "ArticleEntityUpdateContent",
+            "ArticleEntityPublish",
+        ]
+
+    def test_create_article_draft_skips_publish(self):
+        client = self._make_client()
+        calls = []
+
+        def mock_graphql_post(operation_name, variables, features=None):
+            calls.append(operation_name)
+            if operation_name == "ArticleEntityDraftCreate":
+                return {
+                    "data": {
+                        "articleentity_create_draft": {
+                            "article_entity_results": {"result": {"rest_id": "draft-2"}}
+                        }
+                    }
+                }
+            return {"data": {}}
+
+        client._graphql_post = mock_graphql_post
+        result = client.create_article("Draft title", {"blocks": [], "entity_map": []}, publish=False)
+
+        assert result["id"] == "draft-2"
+        assert result["published"] is False
+        assert result["url"] == "https://x.com/compose/article/edit/draft-2"
+        assert calls == [
+            "ArticleEntityDraftCreate",
+            "ArticleEntityUpdateTitle",
+            "ArticleEntityUpdateContent",
+        ]
