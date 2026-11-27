@@ -207,8 +207,8 @@ class TestBuildGraphqlUrl:
         assert len(url) < 8000, f"URL too long: {len(url)} chars"
 
     def test_searchtimeline_fallback_query_id_regression(self):
-        """Keep SearchTimeline fallback aligned with the live operation after issue #39."""
-        assert FALLBACK_QUERY_IDS["SearchTimeline"] == "VhUd6vHVmLBcw0uX-6jMLA"
+        """Keep SearchTimeline fallback aligned with the live operation."""
+        assert FALLBACK_QUERY_IDS["SearchTimeline"] == "vLHjqbDv7TPFMBkIIO1nOA"
 
 
 # ── _best_chrome_target ──────────────────────────────────────────────────
@@ -1356,7 +1356,9 @@ class TestUploadMedia:
         client._max_retries = 3
         client._retry_base_delay = 5.0
         client._max_count = 200
-        client._client_transaction = None
+        # media upload is a POST: it needs a transaction id like any other write
+        client._client_transaction = MagicMock()
+        client._client_transaction.generate_transaction_id.return_value = "tid-media"
         client._ct_init_attempted = True
         return client
 
@@ -1496,7 +1498,9 @@ class TestFetchSearchUsesPost:
         client._max_retries = 0
         client._retry_base_delay = 0
         client._max_count = 200
-        client._client_transaction = None
+        # media upload is a POST: it needs a transaction id like any other write
+        client._client_transaction = MagicMock()
+        client._client_transaction.generate_transaction_id.return_value = "tid-media"
         client._ct_init_attempted = True
         return client
 
@@ -1545,3 +1549,286 @@ class TestFetchSearchUsesPost:
 
         assert captured.get("product") == "Latest"
         assert captured.get("querySource") == "typed_query"
+
+
+# ── Stale queryId retry & resolution ─────────────────────────────────────
+
+
+class TestStaleQueryRetry:
+    def test_graphql_get_retries_query_unspecified_with_live_id(self):
+        client = TwitterClient.__new__(TwitterClient)
+        fallback = FALLBACK_QUERY_IDS["HomeTimeline"]
+        urls = []
+
+        def api_get(url):
+            urls.append(url)
+            if len(urls) == 1:
+                raise TwitterAPIError(0, "Twitter API returned errors: Query: Unspecified")
+            return {"data": {"home": {}}}
+
+        client._api_get = api_get
+
+        with (
+            patch(
+                "twitter_cli.client._resolve_query_id",
+                side_effect=[fallback, "live-query-id"],
+            ) as resolve,
+            patch("twitter_cli.client._invalidate_query_id") as invalidate,
+        ):
+            result = client._graphql_get("HomeTimeline", {"count": 3}, FEATURES)
+
+        assert result == {"data": {"home": {}}}
+        assert fallback in urls[0]
+        assert "live-query-id" in urls[1]
+        assert resolve.call_count == 2
+        assert resolve.call_args_list[1].kwargs["prefer_fallback"] is False
+        invalidate.assert_called_once_with("HomeTimeline")
+
+    def test_graphql_post_retries_query_unspecified_with_live_id(self):
+        client = TwitterClient.__new__(TwitterClient)
+        fallback = FALLBACK_QUERY_IDS["CreateTweet"]
+        requests = []
+
+        def api_request(url, method="GET", body=None):
+            requests.append((url, method, body))
+            if len(requests) == 1:
+                raise TwitterAPIError(0, "Twitter API returned errors: Query: Unspecified")
+            return {"data": {"create_tweet": {}}}
+
+        client._api_request = api_request
+
+        with (
+            patch(
+                "twitter_cli.client._resolve_query_id",
+                side_effect=[fallback, "live-query-id"],
+            ),
+            patch("twitter_cli.client._invalidate_query_id") as invalidate,
+        ):
+            result = client._graphql_post("CreateTweet", {"tweet_text": "hello"}, FEATURES)
+
+        assert result == {"data": {"create_tweet": {}}}
+        assert requests[0][2]["queryId"] == fallback
+        assert requests[1][2]["queryId"] == "live-query-id"
+        invalidate.assert_called_once_with("CreateTweet")
+
+    def test_graphql_get_does_not_retry_unrelated_status_zero_error(self):
+        client = TwitterClient.__new__(TwitterClient)
+        fallback = FALLBACK_QUERY_IDS["HomeTimeline"]
+        client._api_get = MagicMock(
+            side_effect=TwitterAPIError(0, "Twitter API network error: timeout")
+        )
+
+        with (
+            patch("twitter_cli.client._resolve_query_id", return_value=fallback) as resolve,
+            patch("twitter_cli.client._invalidate_query_id") as invalidate,
+            pytest.raises(TwitterAPIError),
+        ):
+            client._graphql_get("HomeTimeline", {"count": 3}, FEATURES)
+
+        resolve.assert_called_once()
+        invalidate.assert_not_called()
+
+
+class TestQueryIdResolution:
+    def test_env_override_takes_precedence(self, monkeypatch):
+        from twitter_cli import graphql
+
+        monkeypatch.setenv("TWITTER_QID_SearchTimeline", "pinned-search-qid")
+        assert graphql._resolve_query_id("SearchTimeline") == "pinned-search-qid"
+
+    def test_disk_cache_roundtrip_and_invalidation(self, monkeypatch, tmp_path):
+        import json
+        from twitter_cli import graphql
+
+        cache_file = tmp_path / "query_ids_cache.json"
+        monkeypatch.setattr(graphql, "_qid_cache_path", lambda: cache_file)
+        monkeypatch.setattr(graphql, "_cached_query_ids", {})
+        monkeypatch.setattr(graphql, "_disk_cache_loaded", False)
+
+        graphql._save_disk_query_ids({"HomeTimeline": "disk-cached-id"})
+        assert cache_file.exists()
+
+        resolved = graphql._resolve_query_id("HomeTimeline", prefer_fallback=True)
+        assert resolved == "disk-cached-id"
+
+        graphql._invalidate_query_id("HomeTimeline")
+        assert "HomeTimeline" not in graphql._cached_query_ids
+        assert "HomeTimeline" not in json.loads(cache_file.read_text(encoding="utf-8"))["query_ids"]
+
+    def test_scan_bundles_follows_xweb_assets(self, monkeypatch, tmp_path):
+        from twitter_cli import graphql
+
+        cache_file = tmp_path / "query_ids_cache.json"
+        monkeypatch.setattr(graphql, "_qid_cache_path", lambda: cache_file)
+        monkeypatch.setattr(graphql, "_cached_query_ids", {})
+        monkeypatch.setattr(graphql, "_bundles_scanned", False)
+
+        def fake_fetch(url, headers=None):
+            if url == "https://x.com/i/jf/":
+                return '<script src="https://abs.twimg.com/x-web/x-web/entry-client.js"></script>'
+            if url == "https://abs.twimg.com/x-web/x-web/entry-client.js":
+                return 'const deps=["./assets/chunk-abc.js"];'
+            if url == "https://abs.twimg.com/x-web/x-web/assets/chunk-abc.js":
+                return 'queryId:"freshQid123",operationName:"SearchTimeline"'
+            raise RuntimeError("unexpected url: " + url)
+
+        graphql._scan_bundles(fake_fetch)
+        assert graphql._cached_query_ids["SearchTimeline"] == "freshQid123"
+
+
+# ── ClientTransaction bootstrap (x-client-transaction-id) ───────────────
+
+_CT_HOME_HTML = (
+    '<html><head>'
+    '<meta name="twitter-site-verification" content="MTIzNDU2Nzg5MGFiY2RlZmI="/>'
+    '</head><body>'
+    '<script>window.__M={0:"unused",59924:"ondemand.s",60041:"i18n"}</script>'
+    '<script>window.__H={0:"0000000000000000",59924:"38289b77fa31a72c",60041:"deadbeef12345678"}</script>'
+    '<svg id="loading-x-anim-0"><g><path d="M0 0 C 10 20, 30 40, 50 60 70 80, 90 100, 110 120"/></g></svg>'
+    '<svg id="loading-x-anim-1"><g><path d="M0 0 C 5 10, 15 25, 25 35 45 45, 55 55, 65 65"/></g></svg>'
+    '<svg id="loading-x-anim-2"><g><path d="M1 1 C 2 2, 3 3, 4 4 5 5, 6 6, 7 7"/></g></svg>'
+    '<svg id="loading-x-anim-3"><g><path d="M2 2 C 3 3, 4 4, 5 5 6 6, 7 7, 8 8"/></g></svg>'
+    '</body></html>'
+)
+
+_CT_STRIPPED_HTML = "<html><body><script>window.__STRIPPED=1;</script></body></html>"
+
+_CT_ONDEMAND_JS = (
+    "var a=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,"
+    "26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45];"
+    "var b=function(c){return(a[(c[0], 16)],(a[(c[1], 17)]),(a[(c[2], 18)]),"
+    "(a[(c[3], 19)]),(a[(c[4], 20)]));};var d=b(a);"
+)
+
+
+class TestClientTransactionBootstrap:
+    def _make_client(self, cookie_string=None):
+        client = TwitterClient.__new__(TwitterClient)
+        client._auth_token = "auth_tok"
+        client._ct0 = "ct0_val"
+        client._cookie_string = cookie_string
+        client._client_transaction = None
+        client._ct_init_attempted = False
+        client._load_ct_cache = MagicMock(return_value=False)
+        client._save_ct_cache = MagicMock()
+        return client
+
+    @patch("twitter_cli.client._update_features_from_html")
+    @patch("twitter_cli.client.ClientTransaction")
+    @patch("twitter_cli.client._gen_ct_headers", return_value={"Referer": "https://x.com"})
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_bootstraps_from_home_with_cookie(
+        self, mock_session, _mock_ct_headers, mock_tx, _mock_features
+    ):
+        import bs4
+
+        home_page = MagicMock(content=_CT_HOME_HTML.encode("utf-8"), text=_CT_HOME_HTML)
+        ondemand_page = MagicMock(text=_CT_ONDEMAND_JS)
+        mock_session.return_value.get.side_effect = [home_page, ondemand_page]
+
+        client = self._make_client(cookie_string="auth_token=auth_tok; ct0=ct0_val")
+        client._ensure_client_transaction()
+
+        first = mock_session.return_value.get.call_args_list[0]
+        second = mock_session.return_value.get.call_args_list[1]
+        assert first.args[0] == "https://x.com/home"
+        assert first.kwargs["headers"]["Cookie"] == "auth_token=auth_tok; ct0=ct0_val"
+        assert second.args[0] == (
+            "https://abs.twimg.com/responsive-web/client-web/"
+            "ondemand.s.38289b77fa31a72ca.js"
+        )
+        # Session cookies must not leak onto the CDN ondemand JS fetch.
+        assert "Cookie" not in second.kwargs["headers"]
+        mock_tx.assert_called_once()
+        assert isinstance(mock_tx.call_args.kwargs["home_page_response"], bs4.BeautifulSoup)
+
+    @patch("twitter_cli.client._update_features_from_html")
+    @patch("twitter_cli.client.ClientTransaction")
+    @patch("twitter_cli.client._gen_ct_headers", return_value={"Referer": "https://x.com"})
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_falls_back_to_i_jf_when_home_lacks_ondemand(
+        self, mock_session, _mock_ct_headers, mock_tx, _mock_features
+    ):
+        stripped = MagicMock(content=_CT_STRIPPED_HTML.encode("utf-8"), text=_CT_STRIPPED_HTML)
+        jf_page = MagicMock(content=_CT_HOME_HTML.encode("utf-8"), text=_CT_HOME_HTML)
+        ondemand_page = MagicMock(text=_CT_ONDEMAND_JS)
+        mock_session.return_value.get.side_effect = [stripped, jf_page, ondemand_page]
+
+        client = self._make_client(cookie_string=None)
+        client._ensure_client_transaction()
+
+        calls = mock_session.return_value.get.call_args_list
+        assert calls[0].args[0] == "https://x.com/home"
+        assert calls[1].args[0] == "https://x.com/i/jf/"
+        assert "Cookie" not in calls[1].kwargs["headers"]
+        assert calls[2].args[0] == (
+            "https://abs.twimg.com/responsive-web/client-web/"
+            "ondemand.s.38289b77fa31a72ca.js"
+        )
+        mock_tx.assert_called_once()
+
+    def test_real_parser_resolves_ondemand_from_current_layout(self):
+        import bs4
+        from x_client_transaction.utils import get_ondemand_file_url
+
+        soup = bs4.BeautifulSoup(_CT_HOME_HTML, "html.parser")
+        url = get_ondemand_file_url(response=soup)
+        assert url == (
+            "https://abs.twimg.com/responsive-web/client-web/"
+            "ondemand.s.38289b77fa31a72ca.js"
+        )
+
+
+# ── Fail-closed guard for unsigned POSTs ─────────────────────────────────
+
+
+class TestUnsignedWriteGuard:
+    @staticmethod
+    def _client():
+        client = TwitterClient.__new__(TwitterClient)
+        client._auth_token = "test_token"
+        client._ct0 = "test_ct0"
+        client._cookie_string = None
+        client._client_transaction = None
+        client._ct_init_attempted = True
+        return client
+
+    def test_post_without_transaction_id_is_refused(self):
+        client = self._client()
+        with pytest.raises(TwitterAPIError) as exc:
+            client._build_headers("https://x.com/i/api/graphql/qid/CreateTweet", "POST")
+        assert "REFUSING unsigned write" in str(exc.value)
+
+    def test_override_env_allows_unsigned_post(self, monkeypatch):
+        monkeypatch.setenv("TWITTER_ALLOW_UNSIGNED", "1")
+        client = self._client()
+        headers = client._build_headers(
+            "https://x.com/i/api/graphql/qid/CreateTweet", "POST"
+        )
+        assert "X-Client-Transaction-Id" not in headers
+
+    def test_get_without_transaction_id_is_allowed(self):
+        client = self._client()
+        headers = client._build_headers(
+            "https://x.com/i/api/graphql/qid/HomeTimeline", "GET"
+        )
+        assert "X-Client-Transaction-Id" not in headers
+        assert "Authorization" in headers
+
+    def test_post_with_transaction_id_sets_header(self):
+        client = self._client()
+        transaction = MagicMock()
+        transaction.generate_transaction_id.return_value = "tid-123"
+        client._client_transaction = transaction
+        headers = client._build_headers(
+            "https://x.com/i/api/graphql/qid/CreateTweet", "POST"
+        )
+        assert headers["X-Client-Transaction-Id"] == "tid-123"
+
+    def test_failing_generator_also_refuses(self):
+        client = self._client()
+        transaction = MagicMock()
+        transaction.generate_transaction_id.side_effect = RuntimeError("boom")
+        client._client_transaction = transaction
+        with pytest.raises(TwitterAPIError):
+            client._build_headers("https://x.com/i/api/graphql/qid/CreateTweet", "POST")

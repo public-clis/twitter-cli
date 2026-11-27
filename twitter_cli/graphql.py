@@ -1,20 +1,25 @@
 """GraphQL infrastructure for Twitter API.
 
-Handles queryId resolution, URL building, JS bundle scanning,
-and feature flag management.
+Handles queryId resolution (env overrides, disk cache, community OpenAPI,
+JS bundle scanning, and fallback constants), URL building, and feature flag
+management.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import time
 import urllib.parse
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from typing import Any, Dict, Optional  # noqa: F401
 
+from .cache import _open_owner_only, _tighten_dir
 from .exceptions import QueryIdError
 
 logger = logging.getLogger(__name__)
@@ -26,27 +31,30 @@ TWITTER_OPENAPI_URL = (
 )
 
 # ── Fallback (hardcoded) queryIds ────────────────────────────────────────
+# Refreshed against twitter-openapi placeholder.json on 2026-11-27.
+# Override any single operation at runtime via TWITTER_QID_<OPERATION>.
 FALLBACK_QUERY_IDS = {
-    "HomeTimeline": "c-CzHF1LboFilMpsx4ZCrQ",
-    "HomeLatestTimeline": "BKB7oi212Fi7kQtCBGE4zA",
-    "UserByScreenName": "1VOOyvKkiI3FMmkeDNxM9A",
-    "UserTweets": "q6xj5bs0hapm9309hexA_g",
-    "TweetDetail": "xd_EMdYvB9hfZsZ6Idri0w",
-    "Likes": "lIDpu_NWL7_VhimGGt0o6A",
-    "SearchTimeline": "VhUd6vHVmLBcw0uX-6jMLA",
-    "Bookmarks": "2neUNDqrrFzbLui8yallcQ",
-    "ListLatestTweetsTimeline": "RlZzktZY_9wJynoepm8ZsA",
-    "Followers": "IOh4aS6UdGWGJUYTqliQ7Q",
-    "Following": "zx6e-TLzRkeDO_a7p4b3JQ",
-    "CreateTweet": "IID9x6WsdMnTlXnzXGq8ng",
-    "DeleteTweet": "VaenaVgh5q5ih7kvyVjgtg",
+    "HomeTimeline": "KmJCeZ__ef1fNos7tKN_fg",
+    "HomeLatestTimeline": "IVA5BUbeYPTrpYekQH7jiA",
+    "UserByScreenName": "AMIBMjtxEEATh4z8V9GtRg",
+    "UserByRestId": "mxaYWwt52eAb6OAzYHMVzg",
+    "UserTweets": "7_KBXBpG0zBPRN6UCIV0-w",
+    "TweetDetail": "dQDdKtt882nl-Km98FJGSQ",
+    "Likes": "ZjyvI1V9gajq5eclHCObzA",
+    "SearchTimeline": "vLHjqbDv7TPFMBkIIO1nOA",
+    "Bookmarks": "fjf5b5Lu82lYMSBRhppK2g",
+    "ListLatestTweetsTimeline": "UMc_lPEeKz_WiKSY8ZT7yw",
+    "Followers": "Xe3y9_ndZ9-RtWz8zd_wpg",
+    "Following": "eDqlbOS46zda8jDT8dEQ_Q",
+    "CreateTweet": "wR5Z_lEibLvkew3tF9w-Sg",
+    "DeleteTweet": "nxpZCY2K-I6QoFHAHeojFQ",
     "FavoriteTweet": "lI07N6Otwv1PhnEgXILM7A",
     "UnfavoriteTweet": "ZYKSe-w7KEslx3JhSIk5LA",
-    "CreateRetweet": "ojPdsZsimiJrUGLR1sjUtA",
-    "DeleteRetweet": "iQtK4dl5hBmXewYZuEOKVw",
+    "CreateRetweet": "mbRO74GrOvSfRcJnlMapnQ",
+    "DeleteRetweet": "ZyZigVsNiFO6v1dEks1eWg",
     "CreateBookmark": "aoDbu3RHznuiSkQ9aNM67Q",
     "DeleteBookmark": "Wlmlj2-xzyS1GN3a6cj-mQ",
-    "TweetResultByRestId": "7xflPyRiUxGVbJd4uWmbfg",
+    "TweetResultByRestId": "U8lc5aomF5krJzZ9vJ9wxg",
     "BookmarkFoldersSlice": "i78YDd0Tza-dV4SYs58kRg",
     "BookmarkFolderTimeline": "hNY7X2xE2N7HVF6Qb_mu6w",
 }
@@ -80,7 +88,84 @@ FEATURES = dict(_DEFAULT_FEATURES)
 
 # Module-level caches (not thread-safe — CLI is single-threaded)
 _cached_query_ids: Dict[str, str] = {}
+_disk_cache_loaded = False
 _bundles_scanned = False
+
+_QID_CACHE_TTL = 86400  # 24 hours
+_MAX_SCAN_CHUNKS = 100
+
+
+def _qid_cache_path() -> Path:
+    """Return path for the persistent queryId cache file."""
+    return Path.home() / ".twitter-cli" / "query_ids_cache.json"
+
+
+def _load_disk_query_ids() -> Dict[str, str]:
+    """Load non-expired queryIds from disk cache."""
+    global _disk_cache_loaded
+    if _disk_cache_loaded:
+        return {}
+    _disk_cache_loaded = True
+    try:
+        path = _qid_cache_path()
+        if not path.exists():
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return {}
+        if time.time() - float(payload.get("created_at", 0)) > _QID_CACHE_TTL:
+            return {}
+        qids = payload.get("query_ids", {})
+        if isinstance(qids, dict):
+            return {str(k): str(v) for k, v in qids.items() if k and v}
+    except Exception as exc:
+        logger.debug("Failed to load queryId disk cache: %s", exc)
+    return {}
+
+
+def _save_disk_query_ids(query_ids: Dict[str, str]) -> None:
+    """Persist live-resolved queryIds to disk with owner-only permissions."""
+    if not query_ids:
+        return
+    try:
+        path = _qid_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _tighten_dir(path.parent)
+        existing: Dict[str, str] = {}
+        if path.exists():
+            try:
+                old = json.loads(path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(old, dict)
+                    and time.time() - float(old.get("created_at", 0)) <= _QID_CACHE_TTL
+                    and isinstance(old.get("query_ids"), dict)
+                ):
+                    existing = {str(k): str(v) for k, v in old["query_ids"].items() if k and v}
+            except Exception:
+                pass
+        existing.update(query_ids)
+        payload = {"created_at": time.time(), "query_ids": existing}
+        with _open_owner_only(path) as f:
+            json.dump(payload, f, indent=2)
+    except Exception as exc:
+        logger.debug("Failed to save queryId disk cache: %s", exc)
+
+
+def _remove_disk_query_id(operation_name: str) -> None:
+    """Remove a stale queryId from the disk cache if present."""
+    try:
+        path = _qid_cache_path()
+        if not path.exists():
+            return
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("query_ids"), dict):
+            return
+        if operation_name in payload["query_ids"]:
+            payload["query_ids"].pop(operation_name, None)
+            with _open_owner_only(path) as f:
+                json.dump(payload, f, indent=2)
+    except Exception as exc:
+        logger.debug("Failed to update queryId disk cache: %s", exc)
 
 
 def _build_graphql_url(query_id, operation_name, variables, features, field_toggles=None):
@@ -90,7 +175,6 @@ def _build_graphql_url(query_id, operation_name, variables, features, field_togg
     Only includes True-valued feature flags in the URL to avoid 414 URI Too Long.
     Twitter's API defaults missing features to False.
     """
-    # Compact features: omit False values to keep URL under server limits
     compact_features = {k: v for k, v in features.items() if v is not False}
     url = "https://x.com/i/api/graphql/%s/%s?variables=%s&features=%s" % (
         query_id,
@@ -109,6 +193,9 @@ def _scan_bundles(url_fetch_fn):
     # type: (Any) -> None
     """Scan Twitter JS bundles and cache queryId mappings.
 
+    Supports both legacy ``responsive-web/client-web`` bundles (via ``/i/jf/``)
+    and newer ``x-web/x-web`` Vite bundles (following relative asset chunks).
+
     Args:
         url_fetch_fn: Function to fetch URLs (injected to avoid circular import).
     """
@@ -117,34 +204,69 @@ def _scan_bundles(url_fetch_fn):
         return
     _bundles_scanned = True
 
+    script_pattern = re.compile(
+        r'(?:src|href)=["\']'
+        r'(https://abs\.twimg\.com/(?:responsive-web/client-web|x-web/x-web)[^"\']+'
+        r'\.js)'
+        r'["\']'
+    )
+    script_urls = []
     try:
         from .constants import get_user_agent
-        html = url_fetch_fn("https://x.com", {"user-agent": get_user_agent()})
-        script_pattern = re.compile(
-            r'(?:src|href)=["\']'
-            r'(https://abs\.twimg\.com/responsive-web/client-web[^"\']+'
-            r'\.js)'
-            r'["\']'
-        )
-        script_urls = script_pattern.findall(html)
+
+        headers = {"user-agent": get_user_agent()}
+        for page_url in ("https://x.com/i/jf/", "https://x.com"):
+            try:
+                html = url_fetch_fn(page_url, headers)
+                found_urls = script_pattern.findall(html)
+                if found_urls:
+                    script_urls = found_urls
+                    break
+            except Exception as exc:  # pragma: no cover - network-dependent branch
+                logger.debug("Bundle page fetch failed for %s: %s", page_url, exc)
+                continue
     except Exception as exc:  # pragma: no cover - network-dependent branch
         logger.warning("Failed to scan JS bundles: %s", exc)
         return
 
-    for script_url in script_urls:
+    if not script_urls:
+        return
+
+    discovered: Dict[str, str] = {}
+    op_pattern = re.compile(
+        r'queryId:\s*"([A-Za-z0-9_-]+)"[^}]{0,200}'
+        r'operationName:\s*"([^"]+)"'
+    )
+    chunk_ref_pattern = re.compile(r'["\'](?:\./)?assets/([A-Za-z0-9._\-]+\.js)["\']')
+
+    seen_urls = set()
+    queue = list(script_urls)
+    scanned = 0
+    while queue and scanned < _MAX_SCAN_CHUNKS:
+        script_url = queue.pop(0)
+        if script_url in seen_urls:
+            continue
+        seen_urls.add(script_url)
+        scanned += 1
         try:
             bundle = url_fetch_fn(script_url)
-            op_pattern = re.compile(
-                r'queryId:\s*"([A-Za-z0-9_-]+)"[^}]{0,200}'
-                r'operationName:\s*"([^"]+)"'
-            )
             for match in op_pattern.finditer(bundle):
                 query_id, operation_name = match.group(1), match.group(2)
                 _cached_query_ids.setdefault(operation_name, query_id)
+                discovered.setdefault(operation_name, query_id)
+
+            if "/x-web/x-web/" in script_url:
+                base = script_url.rsplit("/", 1)[0] + "/"
+                for rel in chunk_ref_pattern.findall(bundle):
+                    chunk_url = base + "assets/" + rel
+                    if chunk_url not in seen_urls:
+                        queue.append(chunk_url)
         except Exception:
             continue
 
-    logger.info("Scanned %d JS bundles, cached %d query IDs", len(script_urls), len(_cached_query_ids))
+    if discovered:
+        _save_disk_query_ids(discovered)
+    logger.info("Scanned %d JS bundles, cached %d query IDs", scanned, len(_cached_query_ids))
 
 
 def _update_features_from_html(html):
@@ -164,8 +286,6 @@ def _update_features_from_html(html):
         for match in feature_pattern.finditer(html):
             key = match.group(1)
             value = match.group(2).lower() == "true"
-            # Only update keys already in FEATURES — never add new ones
-            # Adding new keys inflates URL length, causing 414/431 errors
             if key in FEATURES and FEATURES[key] != value:
                 logger.debug("Feature flag updated: %s = %s -> %s", key, FEATURES[key], value)
                 FEATURES[key] = value
@@ -193,26 +313,68 @@ def _fetch_from_github(url_fetch_fn, operation_name):
 
 def _invalidate_query_id(operation_name):
     # type: (str) -> None
-    """Remove a cached queryId for an operation."""
+    """Remove a cached queryId for an operation (memory and disk)."""
     _cached_query_ids.pop(operation_name, None)
+    _remove_disk_query_id(operation_name)
+
+
+def refresh_query_ids(url_fetch_fn):
+    # type: (Any) -> Dict[str, str]
+    """Force a live refresh of queryIds from twitter-openapi and x.com bundles."""
+    global _bundles_scanned
+    _cached_query_ids.clear()
+    _bundles_scanned = False
+    refreshed: Dict[str, str] = {}
+
+    try:
+        payload = url_fetch_fn(TWITTER_OPENAPI_URL)
+        parsed = json.loads(payload)
+        if isinstance(parsed, dict):
+            for op_name, op_data in parsed.items():
+                if isinstance(op_data, dict):
+                    qid = op_data.get("queryId")
+                    if isinstance(qid, str) and qid:
+                        refreshed[op_name] = qid
+    except Exception as exc:
+        logger.debug("GitHub bulk queryId refresh failed: %s", exc)
+
+    _scan_bundles(url_fetch_fn)
+    refreshed.update(_cached_query_ids)
+    _cached_query_ids.update(refreshed)
+    if refreshed:
+        _save_disk_query_ids(refreshed)
+    return dict(refreshed)
 
 
 def _resolve_query_id(operation_name, prefer_fallback=True, url_fetch_fn=None):
     # type: (str, bool, Any) -> str
-    """Resolve queryId using cache, remote sources, and fallback constants."""
+    """Resolve queryId using env override, caches, remote sources, and fallbacks."""
+    # 1. Explicit per-operation environment override: TWITTER_QID_<OperationName>
+    env_override = os.environ.get("TWITTER_QID_%s" % operation_name, "").strip()
+    if env_override:
+        return env_override
+
+    # 2. In-memory cache (populated from disk cache or prior lookups)
+    if not _disk_cache_loaded:
+        for op_name, qid in _load_disk_query_ids().items():
+            _cached_query_ids.setdefault(op_name, qid)
+
     cached = _cached_query_ids.get(operation_name)
     if cached:
         return cached
 
+    # 3. Fallback constants (when prefer_fallback=True)
     fallback = FALLBACK_QUERY_IDS.get(operation_name)
     if prefer_fallback and fallback:
         _cached_query_ids[operation_name] = fallback
         return fallback
 
+    # 4. Live resolution: community twitter-openapi -> x.com JS bundle scan
     if url_fetch_fn:
         github_query_id = _fetch_from_github(url_fetch_fn, operation_name)
         if github_query_id:
             _cached_query_ids[operation_name] = github_query_id
+            _save_disk_query_ids({operation_name: github_query_id})
             return github_query_id
 
         _scan_bundles(url_fetch_fn)
@@ -220,6 +382,7 @@ def _resolve_query_id(operation_name, prefer_fallback=True, url_fetch_fn=None):
         if cached:
             return cached
 
+    # 5. Last-resort fallback
     if fallback:
         _cached_query_ids[operation_name] = fallback
         return fallback

@@ -43,7 +43,6 @@ from .exceptions import (
     TwitterAPIError,
 )
 from .graphql import (
-    FALLBACK_QUERY_IDS,
     FEATURES,
     _build_graphql_url,
     _invalidate_query_id,
@@ -93,8 +92,8 @@ def _best_chrome_target():
         logger.debug("curl_cffi.BrowserType not available, using fallback targets")
         available = set()
 
-    # Preference order: exact chrome versions, then suffixed variants
-    for target in ("chrome133", "chrome133a", "chrome136", "chrome131", "chrome130"):
+    # Preference order: modern Chrome versions first, then older fallbacks
+    for target in ("chrome136", "chrome133a", "chrome133", "chrome131", "chrome130"):
         if target in available:
             return target
     # Fallback: pick highest chrome* with a pure numeric suffix
@@ -131,6 +130,25 @@ def _url_fetch(url, headers=None):
     resp = session.get(url, headers=headers or {}, timeout=30)
     resp.raise_for_status()
     return resp.text
+
+
+def _is_stale_query_error(exc):
+    # type: (TwitterAPIError) -> bool
+    """Return whether an API error indicates a stale persisted query ID."""
+    if exc.status_code in (404, 422):
+        return True
+    if exc.status_code != 0:
+        return False
+    message = exc.message.lower()
+    return any(
+        marker in message
+        for marker in (
+            "query: unspecified",
+            "persistedquerynotfound",
+            "persisted query not found",
+            "query not found",
+        )
+    )
 
 
 # ── TwitterClient ────────────────────────────────────────────────────────
@@ -901,28 +919,27 @@ class TwitterClient:
 
     def _graphql_get(self, operation_name, variables, features, field_toggles=None):
         # type: (str, Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]) -> Dict[str, Any]
-        """Issue GraphQL GET request with automatic stale-fallback retry."""
+        """Issue GraphQL GET request with automatic stale-queryId retry."""
         query_id = _resolve_query_id(operation_name, prefer_fallback=True, url_fetch_fn=_url_fetch)
-        using_fallback = query_id == FALLBACK_QUERY_IDS.get(operation_name)
         url = _build_graphql_url(query_id, operation_name, variables, features, field_toggles)
 
         try:
             return self._api_get(url)
         except TwitterAPIError as exc:
-            # Fallback query IDs can go stale. Retry with live lookup if 404/422.
-            if exc.status_code in (404, 422) and using_fallback:
-                logger.info("Retrying %s with live queryId after %d", operation_name, exc.status_code)
+            # Stale queryIds surface as HTTP 404/422 or GraphQL "Query: Unspecified".
+            if _is_stale_query_error(exc):
+                logger.info("Retrying %s with live queryId after stale-query response", operation_name)
                 _invalidate_query_id(operation_name)
                 refreshed_query_id = _resolve_query_id(operation_name, prefer_fallback=False, url_fetch_fn=_url_fetch)
-                retry_url = _build_graphql_url(refreshed_query_id, operation_name, variables, features, field_toggles)
-                return self._api_get(retry_url)
+                if refreshed_query_id != query_id:
+                    retry_url = _build_graphql_url(refreshed_query_id, operation_name, variables, features, field_toggles)
+                    return self._api_get(retry_url)
             raise
 
     def _graphql_post(self, operation_name, variables, features=None):
         # type: (str, Dict[str, Any], Optional[Dict[str, Any]]) -> Dict[str, Any]
-        """Issue GraphQL POST request with automatic stale-fallback retry."""
+        """Issue GraphQL POST request with automatic stale-queryId retry."""
         query_id = _resolve_query_id(operation_name, prefer_fallback=True, url_fetch_fn=_url_fetch)
-        using_fallback = query_id == FALLBACK_QUERY_IDS.get(operation_name)
 
         def _do_post(qid):
             # type: (str) -> Dict[str, Any]
@@ -935,11 +952,12 @@ class TwitterClient:
         try:
             return _do_post(query_id)
         except TwitterAPIError as exc:
-            if exc.status_code in (404, 422) and using_fallback:
-                logger.info("Retrying POST %s with live queryId after %d", operation_name, exc.status_code)
+            if _is_stale_query_error(exc):
+                logger.info("Retrying POST %s with live queryId after stale-query response", operation_name)
                 _invalidate_query_id(operation_name)
                 refreshed = _resolve_query_id(operation_name, prefer_fallback=False, url_fetch_fn=_url_fetch)
-                return _do_post(refreshed)
+                if refreshed != query_id:
+                    return _do_post(refreshed)
             raise
 
     # ── Internal: HTTP request engine ────────────────────────────────
@@ -1086,12 +1104,28 @@ class TwitterClient:
         except Exception as exc:
             logger.debug("Failed to save CT cache: %s", exc)
 
+    def _ct_bootstrap_cookie(self):
+        # type: () -> Optional[str]
+        """Return session cookie header for authenticated bootstrap, if available."""
+        cookie_string = getattr(self, "_cookie_string", None)
+        if cookie_string:
+            return cookie_string
+        auth_token = getattr(self, "_auth_token", "")
+        ct0 = getattr(self, "_ct0", "")
+        if auth_token and ct0:
+            return "auth_token=%s; ct0=%s" % (auth_token, ct0)
+        return None
+
     def _ensure_client_transaction(self):
         # type: () -> None
         """Initialize ClientTransaction for x-client-transaction-id header.
 
-        Tries cache first (1h TTL), then fetches fresh data from x.com.
-        Also attempts to extract live feature flags from JS bundles.
+        Tries cache first (1h TTL), then fetches fresh responsive-web bootstrap
+        HTML from x.com. Since X migrated anonymous `/` and `/home` to the
+        stripped Vite `x-web` shell without `ondemand.s`, we try authenticated
+        `https://x.com/home` first and fall back to unauthenticated
+        `https://x.com/i/jf/` (which serves the responsive-web shell).
+        Also updates live feature flags from the fetched HTML.
         """
         if self._ct_init_attempted:
             return
@@ -1101,21 +1135,49 @@ class TwitterClient:
         if self._load_ct_cache():
             return
 
+        last_exc: Optional[Exception] = None
         try:
             # Use curl_cffi for ClientTransaction init to maintain consistent
             # Chrome TLS fingerprint. Using Python requests here would leak
             # a different TLS fingerprint on the same IP — a detection vector.
             cffi_session = _get_cffi_session()
-            ct_headers = _gen_ct_headers()
-            home_page = cffi_session.get(
-                "https://x.com", headers=ct_headers, timeout=10,
-            )
-            home_page_response = bs4.BeautifulSoup(home_page.content, "html.parser")
-            ondemand_url = get_ondemand_file_url(response=home_page_response)
-            if not ondemand_url:
-                raise ValueError("Failed to extract ondemand file URL from homepage")
+            base_headers = dict(_gen_ct_headers())
+            cookie_header = self._ct_bootstrap_cookie()
+
+            candidates = []
+            if cookie_header:
+                auth_headers = dict(base_headers)
+                auth_headers["Cookie"] = cookie_header
+                candidates.append(("https://x.com/home", auth_headers))
+            candidates.append(("https://x.com/i/jf/", dict(base_headers)))
+
+            home_page = None
+            home_page_response = None
+            ondemand_url = None
+
+            for bootstrap_url, req_headers in candidates:
+                try:
+                    resp = cffi_session.get(bootstrap_url, headers=req_headers, timeout=10)
+                    soup = bs4.BeautifulSoup(resp.content, "html.parser")
+                    url = get_ondemand_file_url(response=soup)
+                    if url:
+                        home_page = resp
+                        home_page_response = soup
+                        ondemand_url = url
+                        logger.debug("Bootstrapped ClientTransaction from %s", bootstrap_url)
+                        break
+                    last_exc = ValueError("No ondemand.s URL found at %s" % bootstrap_url)
+                except Exception as exc:
+                    last_exc = exc
+                    logger.debug("ClientTransaction bootstrap candidate %s failed: %s", bootstrap_url, exc)
+                    continue
+
+            if not ondemand_url or home_page is None or home_page_response is None:
+                raise last_exc or ValueError("Failed to extract ondemand file URL from x.com")
+
+            # Fetch ondemand JS bundle without session cookies (CDN asset).
             ondemand_file = cffi_session.get(
-                ondemand_url, headers=ct_headers, timeout=10,
+                ondemand_url, headers=base_headers, timeout=10,
             )
             self._client_transaction = ClientTransaction(
                 home_page_response=home_page_response,
@@ -1123,13 +1185,19 @@ class TwitterClient:
             )
             logger.info("ClientTransaction initialized for x-client-transaction-id")
 
-            # Try to extract live FEATURES from the homepage JS bundles
+            # Try to extract live FEATURES from the bootstrap HTML
             _update_features_from_html(home_page.text)
 
             # Save to cache for future use
             self._save_ct_cache(home_page.text, ondemand_file.text)
         except Exception as exc:
-            logger.warning("Failed to init ClientTransaction: %s", exc)
+            logger.warning(
+                "Failed to init ClientTransaction: %s — x-client-transaction-id is "
+                "UNAVAILABLE. Write requests will be REFUSED (unsigned POSTs risk "
+                "account flags/suspension). Run `twitter doctor` to diagnose, or set "
+                "TWITTER_ALLOW_UNSIGNED=1 to override at your own risk.",
+                exc,
+            )
 
     def _build_headers(self, url="", method="GET"):
         # type: (str, str) -> Dict[str, str]
@@ -1163,14 +1231,30 @@ class TwitterClient:
             headers["Content-Type"] = "application/json"
             headers["Referer"] = "https://x.com/compose/post"
             headers["Priority"] = "u=1, i"
-        # Generate x-client-transaction-id if available
+        # Generate x-client-transaction-id. X gates writes and POST queries on
+        # this header; an unsigned POST is treated as automation and can trigger
+        # 344 errors or account suspension. Fail CLOSED by default.
+        tid = None
         if self._client_transaction and url:
             try:
                 path = urllib.parse.urlparse(url).path
                 tid = self._client_transaction.generate_transaction_id(
                     method=method, path=path,
                 )
-                headers["X-Client-Transaction-Id"] = tid
             except Exception as exc:
                 logger.debug("Failed to generate transaction id: %s", exc)
+        if tid:
+            headers["X-Client-Transaction-Id"] = tid
+        elif method == "POST":
+            msg = (
+                "REFUSING unsigned write: x-client-transaction-id is not available "
+                "(ClientTransaction failed to init). X treats unsigned POST requests as "
+                "automation and can flag or suspend the account. Fix the ClientTransaction "
+                "bootstrap, or set TWITTER_ALLOW_UNSIGNED=1 to override at your own risk."
+            )
+            if os.environ.get("TWITTER_ALLOW_UNSIGNED") == "1":
+                logger.warning("%s [overridden by TWITTER_ALLOW_UNSIGNED=1]", msg)
+            else:
+                logger.error("%s", msg)
+                raise TwitterAPIError(0, msg)
         return headers
