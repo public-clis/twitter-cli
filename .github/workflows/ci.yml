@@ -6,18 +6,31 @@ on:
   pull_request:
   workflow_call:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -26,12 +39,16 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --extra dev
+        timeout-minutes: 10
 
       - name: Lint
         run: uv run ruff check .
+        timeout-minutes: 5
 
       - name: Type check
         run: uv run mypy twitter_cli
+        timeout-minutes: 5
 
       - name: Test
         run: uv run pytest -q
+        timeout-minutes: 10

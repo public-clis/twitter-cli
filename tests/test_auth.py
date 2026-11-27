@@ -10,6 +10,13 @@ import pytest
 from twitter_cli import auth
 
 
+def _patch_home(monkeypatch, tmp_path) -> None:
+    """Point ``os.path.expanduser("~")`` at ``tmp_path`` on POSIX and Windows."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    if os.name == "nt":
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+
 def test_get_cookies_prefers_env(monkeypatch) -> None:
     monkeypatch.setattr(auth, "load_from_env", lambda: {"auth_token": "env-token", "ct0": "env-csrf"})
     monkeypatch.setattr(auth, "extract_from_browser", lambda: pytest.fail("should not extract from browser"))
@@ -192,13 +199,8 @@ def test_verify_cookies_logs_attempt_summary_on_non_auth_failures(monkeypatch, c
 
 def test_iter_chrome_cookie_files_default_first(monkeypatch, tmp_path) -> None:
     """Default profile should be yielded first, then Profile N sorted."""
-    # Create the correct platform-specific directory structure
-    if sys.platform == "darwin":
-        chrome_dir = tmp_path / "Library" / "Application Support" / "Google" / "Chrome"
-    elif sys.platform == "win32":
-        chrome_dir = tmp_path / "Google" / "Chrome" / "User Data"
-    else:
-        chrome_dir = tmp_path / ".config" / "Google" / "Chrome"
+    monkeypatch.setattr(auth.sys, "platform", "linux")
+    chrome_dir = tmp_path / ".config" / "Google" / "Chrome"
 
     (chrome_dir / "Default").mkdir(parents=True)
     (chrome_dir / "Default" / "Cookies").touch()
@@ -208,9 +210,7 @@ def test_iter_chrome_cookie_files_default_first(monkeypatch, tmp_path) -> None:
     (chrome_dir / "Profile 1" / "Cookies").touch()
 
     monkeypatch.delenv("TWITTER_CHROME_PROFILE", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    if sys.platform == "win32":
-        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    _patch_home(monkeypatch, tmp_path)
 
     paths = auth._iter_chrome_cookie_files("chrome")
 
@@ -224,17 +224,15 @@ def test_iter_chrome_cookie_files_default_first(monkeypatch, tmp_path) -> None:
 
 def test_iter_chrome_cookie_files_env_override(monkeypatch, tmp_path) -> None:
     """TWITTER_CHROME_PROFILE should restrict to that single profile."""
-    if sys.platform == "darwin":
-        chrome_dir = tmp_path / "Library" / "Application Support" / "Google" / "Chrome"
-    else:
-        chrome_dir = tmp_path / ".config" / "Google" / "Chrome"
+    monkeypatch.setattr(auth.sys, "platform", "linux")
+    chrome_dir = tmp_path / ".config" / "Google" / "Chrome"
 
     (chrome_dir / "Default").mkdir(parents=True)
     (chrome_dir / "Default" / "Cookies").touch()
     (chrome_dir / "Profile 5").mkdir()
     (chrome_dir / "Profile 5" / "Cookies").touch()
 
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _patch_home(monkeypatch, tmp_path)
     monkeypatch.setenv("TWITTER_CHROME_PROFILE", "Profile 5")
 
     paths = auth._iter_chrome_cookie_files("chrome")
@@ -249,13 +247,13 @@ def test_iter_chrome_cookie_files_edge_linux_uses_microsoft_edge_path(monkeypatc
     (edge_dir / "Default").mkdir(parents=True)
     (edge_dir / "Default" / "Cookies").touch()
 
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _patch_home(monkeypatch, tmp_path)
     monkeypatch.delenv("TWITTER_CHROME_PROFILE", raising=False)
 
     paths = auth._iter_chrome_cookie_files("edge")
 
     assert len(paths) == 1
-    assert paths[0].endswith(".config/microsoft-edge/Default/Cookies")
+    assert paths[0] == os.path.join(str(tmp_path), ".config", "microsoft-edge", "Default", "Cookies")
 
 
 def test_iter_chrome_cookie_files_edge_windows_uses_user_data(monkeypatch, tmp_path) -> None:

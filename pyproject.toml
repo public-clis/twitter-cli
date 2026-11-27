@@ -24,8 +24,11 @@ dependencies = [
     "click>=8.0",
     "rich>=13.0",
     "PyYAML>=6.0",
-    "curl_cffi>=0.7",
-    "xclienttransaction>=1.0.1",
+    # >=0.15.0 is required: earlier releases are affected by
+    # GHSA-qw2m-4pqf-rmpp (CVE-2026-33752), a redirect-based SSRF.
+    "curl_cffi>=0.15.0",
+    # >=1.0.3 is required for X's numeric webpack module map for ondemand.s.
+    "xclienttransaction>=1.0.3",
     "beautifulsoup4>=4.12",
 ]
 
