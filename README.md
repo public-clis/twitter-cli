@@ -1,6 +1,6 @@
 # twitter-cli
 
-[![CI](https://github.com/jackwener/twitter-cli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jackwener/twitter-cli/actions/workflows/ci.yml)
+[![CI](https://github.com/public-clis/twitter-cli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/public-clis/twitter-cli/actions/workflows/ci.yml)
 [![PyPI version](https://badge.fury.io/py/twitter-cli.svg)](https://pypi.org/project/twitter-cli/)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue.svg)](https://pypi.org/project/twitter-cli/)
 
@@ -78,7 +78,7 @@ uv tool upgrade twitter-cli
 Install from source:
 
 ```bash
-git clone git@github.com:jackwener/twitter-cli.git
+git clone git@github.com:public-clis/twitter-cli.git
 cd twitter-cli
 uv sync
 ```
@@ -262,7 +262,7 @@ fetch:
   count: 50
 
 display:
-  time: "absolute"      # "absolute" | "relative" | "iso"
+  time: "relative"      # "relative" | "absolute" | "iso"
 
 filter:
   mode: "topN"          # "topN" | "score" | "all"
@@ -328,9 +328,9 @@ Mode behavior:
 ### Troubleshooting
 
 - `No Twitter cookies found`
-  - Ensure you are logged in to `x.com` in a supported browser (Arc/Chrome/Edge/Firefox/Brave).
-  - Or set `TWITTER_AUTH_TOKEN` and `TWITTER_CT0` manually.
-  - Run with `-v` to see browser extraction diagnostics.
+  - Ensure you are logged in to `x.com` in a supported browser (Arc/Chrome/Edge/Firefox/Brave/Vivaldi/Zen) or point to a custom directory with `TWITTER_CHROMIUM_USER_DATA_DIR`.
+  - Or set `TWITTER_COOKIE_STRING` (recommended for headless/Windows Chrome >=127) or `TWITTER_AUTH_TOKEN` + `TWITTER_CT0` manually.
+  - Run with `-v` or `twitter doctor` to see diagnostics.
 
 - `Cookie expired or invalid (HTTP 401/403)`
   - Re-login to `x.com` and retry.
@@ -358,7 +358,7 @@ Mode behavior:
 
 
 
-Structured error codes commonly include `not_authenticated`, `not_found`, `invalid_input`, `rate_limited`, and `api_error`.
+Structured error codes commonly include `not_authenticated`, `not_found`, `invalid_input`, `rate_limited`, `network_error`, `query_id_error`, `media_upload_error`, and `api_error`.
 
 ### Development
 
@@ -405,7 +405,7 @@ twitter-cli ships with a [`SKILL.md`](./SKILL.md) so AI agents can execute commo
 #### [Skills CLI](https://github.com/vercel-labs/skills) (Recommended)
 
 ```bash
-npx skills add jackwener/twitter-cli
+npx skills add public-clis/twitter-cli
 ```
 
 | Flag | Description |
@@ -418,7 +418,7 @@ npx skills add jackwener/twitter-cli
 
 ```bash
 mkdir -p .agents/skills
-git clone git@github.com:jackwener/twitter-cli.git .agents/skills/twitter-cli
+git clone git@github.com:public-clis/twitter-cli.git .agents/skills/twitter-cli
 ```
 
 #### ~~OpenClaw / ClawHub~~ (Deprecated)
@@ -562,7 +562,24 @@ twitter follow elonmusk --json
 # 展示、补全与诊断
 twitter --time relative feed           # relative | absolute | iso
 twitter completion zsh                 # bash | zsh | fish
+twitter doctor                         # 检查依赖、配置、认证状态与缓存
 twitter doctor --refresh               # 检查环境并刷新 GraphQL queryId 缓存
+```
+
+### Python 库调用
+
+```python
+from twitter_cli import TwitterClient, get_cookies
+
+cookies = get_cookies()
+client = TwitterClient(
+    cookies["auth_token"],
+    cookies["ct0"],
+    cookie_string=cookies.get("cookie_string"),
+)
+tweets = client.fetch_home_timeline(count=20)
+for tweet in tweets:
+    print(f"@{tweet.author.screen_name}: {tweet.text[:80]}")
 ```
 
 ### 认证说明
@@ -593,7 +610,11 @@ TWITTER_CHROMIUM_USER_DATA_DIR="/path/to/User Data" twitter feed
 TWITTER_BROWSER=chrome twitter feed    # 支持: arc, chrome, edge, firefox, brave, vivaldi, zen
 ```
 
-配置文件查找顺序：显式路径 → 当前目录 `./config.yaml` → `~/.twitter-cli/config.yaml` → 内置默认配置。
+**高级 GraphQL 与签名环境变量**：
+- `TWITTER_QID_<OPERATION>=<queryId>` — 运行时覆盖指定 GraphQL operation 的 queryId（例如 `TWITTER_QID_HomeTimeline=...`）
+- `TWITTER_ALLOW_UNSIGNED=1` — 当写操作（`POST`）无法生成 `x-client-transaction-id` 时默认 fail-closed 拦截以防 226 风控，仅调试时可显式设此变量绕过
+
+**配置文件**：查找顺序为显式路径 → `./config.yaml` → `~/.twitter-cli/config.yaml` → 内置默认配置。可在 `display.time` 设置默认时间格式（`relative` / `absolute` / `iso`），显式 `--max` 可突破默认 `rateLimit.maxCount`（200）直到 10,000 安全上限。结构化输出规范见 [SCHEMA.md](./SCHEMA.md)。
 
 ### 代理支持
 
@@ -633,8 +654,8 @@ score = likes_w * likes
 
 ### 常见问题
 
-- 报错 `No Twitter cookies found`：请先登录 `x.com`，并确认浏览器为 Arc/Chrome/Edge/Firefox/Brave 之一，或手动设置环境变量。
-- 如需查看浏览器提取细节，可加 `-v` 打开诊断日志。
+- 报错 `No Twitter cookies found`：请先登录 `x.com`，并确认浏览器为 Arc/Chrome/Edge/Firefox/Brave/Vivaldi/Zen 之一（或通过 `TWITTER_CHROMIUM_USER_DATA_DIR` 指定目录），或手动设置 `TWITTER_COOKIE_STRING` / `TWITTER_AUTH_TOKEN` + `TWITTER_CT0`。
+- 如需查看浏览器提取细节或环境状态，可加 `-v` 或运行 `twitter doctor`。
 - 报错 `Cookie expired or invalid`：Cookie 过期，重新登录后重试。
 - 报错 `Unable to get key for cookie decryption`（macOS Keychain 问题）：
   - **SSH 远程登录**：Keychain 默认锁定，需手动解锁：
@@ -653,7 +674,7 @@ score = likes_w * likes
 
 
 
-- 结构化错误码通常会区分 `not_authenticated`、`not_found`、`invalid_input`、`rate_limited`、`api_error`。
+- 结构化错误码通常会区分 `not_authenticated`、`not_found`、`invalid_input`、`rate_limited`、`network_error`、`query_id_error`、`media_upload_error`、`api_error`。
 
 ### 使用建议（防封号）
 
@@ -678,7 +699,7 @@ twitter-cli 提供了 [`SKILL.md`](./SKILL.md)，可让 AI Agent 更稳定地调
 #### [Skills CLI](https://github.com/vercel-labs/skills)（推荐）
 
 ```bash
-npx skills add jackwener/twitter-cli
+npx skills add public-clis/twitter-cli
 ```
 
 | 参数 | 说明 |
@@ -691,7 +712,7 @@ npx skills add jackwener/twitter-cli
 
 ```bash
 mkdir -p .agents/skills
-git clone git@github.com:jackwener/twitter-cli.git .agents/skills/twitter-cli
+git clone git@github.com:public-clis/twitter-cli.git .agents/skills/twitter-cli
 ```
 
 #### ~~OpenClaw / ClawHub~~（已过时）

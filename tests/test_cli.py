@@ -1076,7 +1076,7 @@ def test_cli_article_publish_json_and_draft_yaml(monkeypatch, tmp_path) -> None:
         cli, ["article-publish", str(markdown_path), "--title", "Article title", "--json"]
     )
     assert pub_res.exit_code == 0, pub_res.output
-    payload = json.loads(pub_res.output[pub_res.output.index("{"):])
+    payload = json.loads(pub_res.output)
     assert payload["data"]["id"] == "article-1"
     assert payload["data"]["published"] is True
     assert captured["content_state"]["blocks"][0]["type"] == "header-one"

@@ -22,15 +22,12 @@ def _declared_specifiers() -> dict[str, str]:
 
 
 def _parse_version_tuple(raw: str) -> tuple[int, ...]:
-    parts = []
-    for chunk in raw.split("."):
-        digits = "".join(c for c in chunk if c.isdigit())
-        if not digits:
-            break
-        parts.append(int(digits))
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts[:3])
+    # Strip any upper-bound specifier (e.g. "0.14.0,<1.0") before matching digits.
+    lower = raw.split(",", 1)[0].strip()
+    match = re.match(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?", lower)
+    if not match:
+        return (0, 0, 0)
+    return tuple(int(group or 0) for group in match.groups())
 
 
 def test_curl_cffi_floor_excludes_ghsa_qw2m_4pqf_rmpp() -> None:

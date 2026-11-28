@@ -11,6 +11,11 @@ DraftBlock = dict[str, Any]
 DraftEntity = dict[str, Any]
 DraftContentState = dict[str, Any]
 
+_FENCE_OPEN_RE = re.compile(r"^```[A-Za-z0-9_+-]*$")
+_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+_BOLD_RE = re.compile(r"\*\*([^\s*](?:[^*]*[^\s*])?)\*\*")
+_ITALIC_RE = re.compile(r"(?<!\*)\*([^\s*](?:[^*]*[^\s*])?)\*(?!\*)")
+
 
 def _block_key(seed: str, index: int) -> str:
     return hashlib.sha1(("%s:%d" % (seed, index)).encode("utf-8")).hexdigest()[:5]
@@ -58,34 +63,99 @@ def _append_entity(content_state: DraftContentState, entity_type: str, mutabilit
     return key
 
 
-def _extract_links(text: str, content_state: DraftContentState) -> tuple[str, list[dict[str, int]]]:
+def _find_balanced_link_end(text: str, start: int) -> int:
+    """Return index of closing ')' matching '(' at ``start - 1``, or -1."""
+    depth = 1
+    pos = start
+    while pos < len(text):
+        ch = text[pos]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return pos
+        elif ch in ("\n", "\r"):
+            return -1
+        pos += 1
+    return -1
+
+
+def _strip_emphasis(text: str) -> str:
+    """Strip bold/italic Markdown delimiters without harming math/spaced asterisks."""
+    text = _BOLD_RE.sub(r"\1", text)
+    text = _ITALIC_RE.sub(r"\1", text)
+    return text
+
+
+def _process_inline_text(text: str, content_state: DraftContentState) -> tuple[str, list[dict[str, int]]]:
+    """Strip inline markup and extract Markdown links while protecting inline code and images."""
+    code_spans: list[str] = []
+
+    def _stash_code(match: re.Match[str]) -> str:
+        token = "\x00CODE%d\x00" % len(code_spans)
+        code_spans.append(match.group(1))
+        return token
+
+    protected = _INLINE_CODE_RE.sub(_stash_code, text)
+    protected = _strip_emphasis(protected)
+
     ranges: list[dict[str, int]] = []
     output: list[str] = []
     cursor = 0
-    for match in re.finditer(r"\[([^\]]+)\]\(([^)]+)\)", text):
-        output.append(text[cursor:match.start()])
-        label = match.group(1)
-        url = match.group(2)
+    pos = 0
+
+    def _restore_code(segment: str) -> str:
+        if not code_spans:
+            return segment
+        return re.sub(
+            r"\x00CODE(\d+)\x00",
+            lambda m: code_spans[int(m.group(1))],
+            segment,
+        )
+
+    while pos < len(protected):
+        bracket_start = protected.find("[", pos)
+        if bracket_start == -1:
+            break
+        # Skip Markdown images `![alt](url)`
+        if bracket_start > 0 and protected[bracket_start - 1] == "!":
+            pos = bracket_start + 1
+            continue
+        bracket_end = protected.find("]", bracket_start + 1)
+        if bracket_end == -1 or bracket_end + 1 >= len(protected) or protected[bracket_end + 1] != "(":
+            pos = bracket_start + 1
+            continue
+        url_start = bracket_end + 2
+        url_end = _find_balanced_link_end(protected, url_start)
+        if url_end == -1:
+            pos = bracket_start + 1
+            continue
+
+        raw_label = protected[bracket_start + 1:bracket_end]
+        raw_url = protected[url_start:url_end].strip()
+        if not raw_label or not raw_url:
+            pos = url_end + 1
+            continue
+
+        output.append(_restore_code(protected[cursor:bracket_start]))
+        label = _restore_code(raw_label)
+        url = _restore_code(raw_url)
         offset = _utf16_len("".join(output))
         output.append(label)
         entity_key = _append_entity(content_state, "LINK", "Mutable", {"url": url})
         ranges.append({"key": entity_key, "offset": offset, "length": _utf16_len(label)})
-        cursor = match.end()
-    output.append(text[cursor:])
+        cursor = url_end + 1
+        pos = cursor
+
+    output.append(_restore_code(protected[cursor:]))
     return "".join(output), ranges
-
-
-def _strip_inline_markup(text: str) -> str:
-    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
-    text = re.sub(r"\*([^*]+)\*", r"\1", text)
-    text = re.sub(r"`([^`]+)`", r"\1", text)
-    return text
 
 
 def article_markdown_to_content_state(markdown: str) -> DraftContentState:
     """Convert a conservative Markdown subset into X Article content_state.
 
-    Supported block forms: paragraphs, #/## headings, unordered and ordered
+    Supported block forms: paragraphs, #/##/### headings, unordered and ordered
     list items, blockquotes, horizontal rules, fenced code blocks, and inline
     Markdown links.
     """
@@ -101,13 +171,13 @@ def article_markdown_to_content_state(markdown: str) -> DraftContentState:
         if not stripped:
             continue
 
-        if stripped.startswith("```"):
+        if _FENCE_OPEN_RE.match(stripped):
             code_lines: list[str] = []
             opening = stripped
             while i < len(lines):
                 code_line = lines[i].rstrip()
                 i += 1
-                if code_line.strip().startswith("```"):
+                if code_line.strip() == "```":
                     break
                 code_lines.append(code_line)
             markdown_block = opening + "\n" + "\n".join(code_lines) + "\n```"
@@ -124,12 +194,15 @@ def article_markdown_to_content_state(markdown: str) -> DraftContentState:
 
         block_type = "unstyled"
         text = stripped
-        if stripped.startswith("# "):
-            block_type = "header-one"
-            text = stripped[2:].strip()
+        if stripped.startswith("### "):
+            block_type = "header-three"
+            text = stripped[4:].strip()
         elif stripped.startswith("## "):
             block_type = "header-two"
             text = stripped[3:].strip()
+        elif stripped.startswith("# "):
+            block_type = "header-one"
+            text = stripped[2:].strip()
         elif stripped.startswith("> "):
             block_type = "blockquote"
             text = stripped[2:].strip()
@@ -142,7 +215,7 @@ def article_markdown_to_content_state(markdown: str) -> DraftContentState:
                 block_type = "ordered-list-item"
                 text = ordered.group(1).strip()
 
-        text, entity_ranges = _extract_links(_strip_inline_markup(text), content_state)
+        text, entity_ranges = _process_inline_text(text, content_state)
         block = _plain_block(block_type, text, _block_key(text, block_index))
         block["entity_ranges"] = entity_ranges
         content_state["blocks"].append(block)

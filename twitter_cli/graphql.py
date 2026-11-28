@@ -17,9 +17,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import Any, Dict, Optional  # noqa: F401
+    from typing import Any, Collection, Dict, Optional  # noqa: F401
 
-from .cache import _open_owner_only, _tighten_dir
+from .cache import _OWNER_ONLY_DIR, _open_owner_only, _tighten_dir
 from .exceptions import QueryIdError
 from .text import CREATE_NOTE_TWEET_OPERATION, CREATE_TWEET_OPERATION
 
@@ -157,28 +157,37 @@ def _load_disk_query_ids() -> Dict[str, str]:
     return {}
 
 
-def _save_disk_query_ids(query_ids: Dict[str, str]) -> None:
-    """Persist live-resolved queryIds to disk with owner-only permissions."""
+def _save_disk_query_ids(query_ids: Dict[str, str], replace: bool = False) -> None:
+    """Persist live-resolved queryIds to disk with owner-only permissions.
+
+    When ``replace`` is False, merges into any non-expired existing cache while
+    preserving its original ``created_at`` timestamp so stale entries cannot
+    live forever via a sliding TTL. When ``replace`` is True (full refresh),
+    replaces the cache contents and resets ``created_at``.
+    """
     if not query_ids:
         return
     try:
         path = _qid_cache_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(mode=_OWNER_ONLY_DIR, parents=True, exist_ok=True)
         _tighten_dir(path.parent)
         existing: Dict[str, str] = {}
-        if path.exists():
+        created_at = time.time()
+        if not replace and path.exists():
             try:
                 old = json.loads(path.read_text(encoding="utf-8"))
+                old_created_at = float(old.get("created_at", 0)) if isinstance(old, dict) else 0.0
                 if (
                     isinstance(old, dict)
-                    and time.time() - float(old.get("created_at", 0)) <= _QID_CACHE_TTL
+                    and time.time() - old_created_at <= _QID_CACHE_TTL
                     and isinstance(old.get("query_ids"), dict)
                 ):
                     existing = {str(k): str(v) for k, v in old["query_ids"].items() if k and v}
+                    created_at = old_created_at
             except Exception:
                 pass
         existing.update(query_ids)
-        payload = {"created_at": time.time(), "query_ids": existing}
+        payload = {"created_at": created_at, "query_ids": existing}
         with _open_owner_only(path) as f:
             json.dump(payload, f, indent=2)
     except Exception as exc:
@@ -290,8 +299,10 @@ def _scan_bundles(url_fetch_fn):
                 discovered.setdefault(operation_name, query_id)
 
             if "/x-web/x-web/" in script_url:
-                base = script_url.rsplit("/", 1)[0] + "/"
+                base = script_url.split("/x-web/x-web/", 1)[0] + "/x-web/x-web/"
                 for rel in chunk_ref_pattern.findall(bundle):
+                    if ".." in rel:
+                        continue
                     chunk_url = base + "assets/" + rel
                     if chunk_url not in seen_urls:
                         queue.append(chunk_url)
@@ -355,9 +366,10 @@ def _invalidate_query_id(operation_name):
 def refresh_query_ids(url_fetch_fn):
     # type: (Any) -> Dict[str, str]
     """Force a live refresh of queryIds from twitter-openapi and x.com bundles."""
-    global _bundles_scanned
+    global _bundles_scanned, _disk_cache_loaded
     _cached_query_ids.clear()
     _bundles_scanned = False
+    _disk_cache_loaded = True
     refreshed: Dict[str, str] = {}
 
     try:
@@ -376,13 +388,15 @@ def refresh_query_ids(url_fetch_fn):
     refreshed.update(_cached_query_ids)
     _cached_query_ids.update(refreshed)
     if refreshed:
-        _save_disk_query_ids(refreshed)
+        _save_disk_query_ids(refreshed, replace=True)
     return dict(refreshed)
 
 
-def _resolve_query_id(operation_name, prefer_fallback=True, url_fetch_fn=None):
-    # type: (str, bool, Any) -> str
+def _resolve_query_id(operation_name, prefer_fallback=True, url_fetch_fn=None, exclude_ids=None):
+    # type: (str, bool, Any, Optional[Collection[str]]) -> str
     """Resolve queryId using env override, caches, remote sources, and fallbacks."""
+    excluded = set(exclude_ids) if exclude_ids else set()
+
     # 1. Explicit per-operation environment override: TWITTER_QID_<OperationName>
     env_override = os.environ.get("TWITTER_QID_%s" % operation_name, "").strip()
     if env_override:
@@ -394,31 +408,32 @@ def _resolve_query_id(operation_name, prefer_fallback=True, url_fetch_fn=None):
             _cached_query_ids.setdefault(op_name, qid)
 
     cached = _cached_query_ids.get(operation_name)
-    if cached:
+    if cached and cached not in excluded:
         return cached
 
     # 3. Fallback constants (when prefer_fallback=True)
     fallback = FALLBACK_QUERY_IDS.get(operation_name)
-    if prefer_fallback and fallback:
+    if prefer_fallback and fallback and fallback not in excluded:
         _cached_query_ids[operation_name] = fallback
         return fallback
 
     # 4. Live resolution: community twitter-openapi -> x.com JS bundle scan
     if url_fetch_fn:
         github_query_id = _fetch_from_github(url_fetch_fn, operation_name)
-        if github_query_id:
+        if github_query_id and github_query_id not in excluded:
             _cached_query_ids[operation_name] = github_query_id
             _save_disk_query_ids({operation_name: github_query_id})
             return github_query_id
 
         _scan_bundles(url_fetch_fn)
         cached = _cached_query_ids.get(operation_name)
-        if cached:
+        if cached and cached not in excluded:
             return cached
 
     # 5. Last-resort fallback
     if fallback:
-        _cached_query_ids[operation_name] = fallback
+        if fallback not in excluded:
+            _cached_query_ids[operation_name] = fallback
         return fallback
 
     raise QueryIdError('Cannot resolve queryId for "%s"' % operation_name)

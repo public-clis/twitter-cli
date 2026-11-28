@@ -22,34 +22,56 @@ _WEIGHT_ONE_RANGES = (
     (0x2032, 0x2037),
 )
 
-_PROTOCOL_URL = r"https?://[^\s<>{}\[\]\"']+"
-_BARE_URL = (
-    r"(?:[^\W_](?:[\w-]{0,61}[^\W_])?\.)+"
-    r"(?:[^\W\d_]{2,63}|xn--[\w-]{2,59})"
-    r"(?::\d{1,5})?(?:[/?#][^\s<>{}\[\]\"']*)?"
+# Common IANA TLDs recognized by twitter-text for bare domains without http(s)://
+# (prevents filenames like config.yaml / README.md / cli.py or prose like Hello.World
+# from being inflated to 23 chars and misrouted to CreateNoteTweet).
+_COMMON_TLDS = (
+    "com|org|net|edu|gov|mil|int|io|co|ai|app|dev|me|tv|gg|xyz|info|biz|tech|cloud|"
+    "news|live|shop|store|site|online|blog|page|link|so|sh|to|ly|gl|be|de|uk|fr|jp|"
+    "cn|kr|ca|au|in|br|es|it|nl|se|ch|ru|pl|tw|hk|sg|eu|us|nz|id|vn|th|mx|ar|cl|za|"
+    "pro|club|top|icu|vip|cc|fm|im|is|la|vc|ws|ag|am|at|cz|dk|fi|gr|hu|ie|il|no|pt|"
+    "ro|sk|tr|ua|ac|pub|run|bot|fun|wtf|lol|new|now|one|art|inc|nyc|ooo|tel|xxx"
 )
-_URL_RE = re.compile(r"(?<![\w@])(?:%s|%s)" % (_PROTOCOL_URL, _BARE_URL), re.IGNORECASE)
+
+_PROTOCOL_URL = r"(?<![\w@])https?://[^\s<>{}\[\]\"']+"
+_BARE_URL = (
+    r"(?<![\w@/.#])"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"(?:%s|xn--[a-z0-9-]{2,59})"
+    r"(?![\w@])"
+    r"(?::\d{1,5})?(?:[/?#][^\s<>{}\[\]\"']*)?"
+) % _COMMON_TLDS
+_URL_RE = re.compile(r"(?:%s|%s)" % (_PROTOCOL_URL, _BARE_URL), re.IGNORECASE)
 _TRAILING_URL_PUNCTUATION = ".,!?:;'\""
 
 _EMOJI_BASE_RANGES = (
     (0x2190, 0x21FF),
     (0x2300, 0x23FF),
+    (0x25AA, 0x25FE),
     (0x2600, 0x27BF),
+    (0x2934, 0x2935),
+    (0x2B05, 0x2B55),
     (0x1F000, 0x1FAFF),
     (0x1FC00, 0x1FFFF),
 )
-_EMOJI_BASES = {0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D, 0x3297, 0x3299}
+# 0x00A9 (©) and 0x00AE (®) only count as weight-2 emoji when followed by U+FE0F.
+_EMOJI_BASES = {0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D, 0x3297, 0x3299}
+_TEXT_DEFAULT_EMOJI_BASES = {0x00A9, 0x00AE}
 
 
 def _trim_url_end(url):
     # type: (str) -> int
     """Return the URL end before prose punctuation or unmatched closers."""
     end = len(url)
-    while end and url[end - 1] in _TRAILING_URL_PUNCTUATION:
-        end -= 1
-    for opening, closing in (("(", ")"), ("[", "]"), ("{", "}")):
-        while end and url[end - 1] == closing and url[:end].count(closing) > url[:end].count(opening):
+    while end:
+        prev = end
+        while end and url[end - 1] in _TRAILING_URL_PUNCTUATION:
             end -= 1
+        for opening, closing in (("(", ")"), ("[", "]"), ("{", "}")):
+            while end and url[end - 1] == closing and url[:end].count(closing) > url[:end].count(opening):
+                end -= 1
+        if end == prev:
+            break
     return end
 
 
@@ -93,6 +115,11 @@ def _emoji_sequence_end(text, index, limit):
         if index + 1 < limit and 0x1F1E6 <= ord(text[index + 1]) <= 0x1F1FF:
             return index + 2
         return index + 1
+
+    if codepoint in _TEXT_DEFAULT_EMOJI_BASES:
+        if index + 1 < limit and ord(text[index + 1]) == 0xFE0F:
+            return _consume_emoji_suffix(text, index + 2, limit)
+        return None
 
     if not _is_emoji_base(codepoint):
         return None

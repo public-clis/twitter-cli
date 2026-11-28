@@ -24,7 +24,9 @@ _TIME_STYLE = "relative"
 def set_time_style(style: Optional[str]) -> str:
     """Select the timestamp rendering style; returns the style in effect."""
     global _TIME_STYLE
-    if style and style in _TIME_STYLES:
+    if style is None:
+        _TIME_STYLE = "relative"
+    elif style in _TIME_STYLES:
         _TIME_STYLE = style
     return _TIME_STYLE
 
@@ -77,11 +79,12 @@ def print_tweet_table(
     if not title:
         title = "📱 Twitter — %d tweets" % len(tweets)
 
+    stats_width = 29 if _TIME_STYLE == "iso" else 22
     table = Table(title=title, show_lines=True, expand=True)
     table.add_column("#", style="dim", width=3, justify="right")
     table.add_column("Author", style="cyan", width=18, no_wrap=True)
     table.add_column("Tweet", ratio=3)
-    table.add_column("Stats", style="green", width=22, no_wrap=True)
+    table.add_column("Stats", style="green", width=stats_width, no_wrap=True)
     table.add_column("Score", style="yellow", width=6, justify="right")
 
     for i, tweet in enumerate(tweets):
@@ -233,7 +236,7 @@ def print_article(tweet: Tweet, console: Optional[Console] = None) -> None:
     title = tweet.article_title or "Twitter Article"
     meta_parts = [
         "By @%s%s (%s)" % (tweet.author.screen_name, verified, tweet.author.name),
-        "🕐 %s" % tweet.created_at,
+        "🕐 %s" % _render_time(tweet.created_at),
         "🔗 x.com/%s/status/%s" % (tweet.author.screen_name, tweet.id),
         "",
         "❤️ %s  🔄 %s  💬 %s  🔖 %s  👁️ %s"

@@ -142,7 +142,7 @@ def _is_stale_query_error(exc):
     """Return whether an API error indicates a stale persisted query ID."""
     if exc.status_code in (404, 422):
         return True
-    if exc.status_code != 0:
+    if exc.status_code not in (0, 400):
         return False
     message = exc.message.lower()
     return any(
@@ -199,9 +199,10 @@ def _twitter_deeplink_to_url(url):
     if url.startswith(("https://", "http://")):
         return url
     if url.startswith("twitter://trending/"):
-        trend_id = url.rsplit("/", 1)[-1]
+        parsed = urllib.parse.urlparse(url)
+        trend_id = _extract_trend_id(url) or parsed.path.rsplit("/", 1)[-1]
         return "https://x.com/i/trending/%s" % urllib.parse.quote(trend_id)
-    if url.startswith("twitter://search/"):
+    if url.startswith(("twitter://search/", "twitter://search?")):
         parsed = urllib.parse.urlparse(url)
         query = urllib.parse.parse_qs(parsed.query)
         raw_query = query.get("query", [""])[0]
@@ -645,8 +646,11 @@ class TwitterClient:
 
         When ``cursor`` is None, verifies that the focal tweet is present in
         the response (raising NotFoundError instead of silently returning empty
-        or reply-only results) and places it first.
+        or reply-only results) and places it first before truncating to ``count``.
         """
+        if count <= 0:
+            return ([], None) if return_cursor else []
+
         result = self._fetch_timeline(
             "TweetDetail",
             count,
@@ -672,6 +676,7 @@ class TwitterClient:
             },
             start_cursor=cursor,
             return_cursor=return_cursor,
+            truncate=cursor is not None,
         )
         if return_cursor:
             tweets, next_cursor = result
@@ -684,7 +689,8 @@ class TwitterClient:
                 raise NotFoundError(
                     "Tweet %s was not returned by the TweetDetail response" % tweet_id
                 )
-            tweets = [focal_tweet] + [tweet for tweet in tweets if tweet.id != tweet_id]
+            limit = min(count, getattr(self, "_max_count", count))
+            tweets = ([focal_tweet] + [tweet for tweet in tweets if tweet.id != tweet_id])[:limit]
 
         if return_cursor:
             return tweets, next_cursor
@@ -840,11 +846,13 @@ class TwitterClient:
 
     # ── Write operations ─────────────────────────────────────────────
 
-    # Supported image MIME types and max file sizes
+    # Supported image/video MIME types and max file sizes
     _SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+    _SUPPORTED_VIDEO_TYPES = {"video/mp4", "video/quicktime", "video/webm"}
     _MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5 MB
     _MAX_VIDEO_SIZE = 512 * 1024 * 1024  # 512 MB (X hard cap for tweet_video)
-    _VIDEO_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB per APPEND segment
+    # Keep raw chunk <= 2 MB so base64 + form encoding stays safely below X's 5 MB segment limit
+    _VIDEO_CHUNK_SIZE = 2 * 1024 * 1024
     _VIDEO_PROCESS_TIMEOUT = 300  # seconds to wait for async video processing
 
     def _write_delay(self):
@@ -858,18 +866,25 @@ class TwitterClient:
         # type: (str) -> str
         """Upload an image or video file to Twitter.  Returns the media_id string.
 
-        Uses Twitter's chunked upload API (INIT → APPEND → FINALIZE [+ STATUS for video]).
+        Uses Twitter's chunked upload API (INIT → APPEND → FINALIZE [+ STATUS]).
         Images: JPEG, PNG, GIF, WebP up to 5 MB.
-        Videos (mp4/mov/webm): up to 512 MB, uploaded in 4 MB chunks with async STATUS polling.
+        Videos (mp4/mov/webm): up to 512 MB, uploaded in 2 MB chunks with async STATUS polling.
         """
         if not os.path.isfile(file_path):
             raise MediaUploadError("File not found: %s" % file_path)
 
         file_size = os.path.getsize(file_path)
-        media_type = mimetypes.guess_type(file_path)[0] or ""
-        is_video = media_type.startswith("video/")
+        if file_size <= 0:
+            raise MediaUploadError("File is empty: %s" % file_path)
 
-        if is_video:
+        media_type = mimetypes.guess_type(file_path)[0] or ""
+        is_video = media_type in self._SUPPORTED_VIDEO_TYPES
+
+        if media_type.startswith("video/"):
+            if not is_video:
+                raise MediaUploadError(
+                    "Unsupported video format: %s (supported: mp4, mov, webm)" % media_type
+                )
             if file_size > self._MAX_VIDEO_SIZE:
                 raise MediaUploadError(
                     "File too large: %.1f MB (max %.0f MB)"
@@ -886,7 +901,7 @@ class TwitterClient:
                 raise MediaUploadError(
                     "Unsupported image format: %s (supported: jpeg, png, gif, webp)" % media_type
                 )
-            media_category = "tweet_image"
+            media_category = "tweet_gif" if media_type == "image/gif" else "tweet_image"
 
         upload_url = "https://upload.twitter.com/i/media/upload.json"
         session = _get_cffi_session()
@@ -918,10 +933,7 @@ class TwitterClient:
             while True:
                 media_bytes = f.read(self._VIDEO_CHUNK_SIZE if is_video else None)
                 if not media_bytes:
-                    if segment_index == 0 and not is_video:
-                        media_bytes = b""
-                    else:
-                        break
+                    break
                 media_data = base64.b64encode(media_bytes).decode("ascii")
                 headers = self._build_headers(url=upload_url, method="POST")
                 headers.pop("Content-Type", None)
@@ -956,25 +968,34 @@ class TwitterClient:
             raise MediaUploadError("FINALIZE failed (HTTP %d): %s" % (resp.status_code, resp.text[:300]))
         logger.info("Media FINALIZE: media_id=%s ready", media_id)
 
-        # ── STATUS (videos only) ─────────────────────────────────────
-        if is_video:
-            try:
-                finalize_result = json.loads(resp.text)
-            except (json.JSONDecodeError, ValueError):
-                finalize_result = {}
-            info = finalize_result.get("processing_info") if isinstance(finalize_result, dict) else None
-            deadline = time.time() + self._VIDEO_PROCESS_TIMEOUT
+        # ── STATUS (whenever FINALIZE returns processing_info, e.g. video/GIF) ──
+        try:
+            finalize_result = json.loads(resp.text)
+        except (json.JSONDecodeError, ValueError):
+            finalize_result = {}
+        info = finalize_result.get("processing_info") if isinstance(finalize_result, dict) else None
+        if isinstance(info, dict):
+            deadline = time.monotonic() + self._VIDEO_PROCESS_TIMEOUT
             while isinstance(info, dict) and info.get("state") not in (None, "succeeded"):
                 state = info.get("state")
                 if state == "failed":
                     raise MediaUploadError(
-                        "Video processing failed: %s" % json.dumps(info.get("error", info))
+                        "Media processing failed: %s" % json.dumps(info.get("error", info))
                     )
-                wait = max(1, int(info.get("check_after_secs", 3)))
-                time.sleep(wait)
-                if time.time() > deadline:
+                raw_wait = info.get("check_after_secs")
+                try:
+                    wait = max(1.0, float(raw_wait)) if raw_wait is not None else 3.0
+                except (TypeError, ValueError):
+                    wait = 3.0
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     raise MediaUploadError(
-                        "Video processing timed out after %ds" % self._VIDEO_PROCESS_TIMEOUT
+                        "Media processing timed out after %ds" % self._VIDEO_PROCESS_TIMEOUT
+                    )
+                time.sleep(min(wait, remaining))
+                if time.monotonic() >= deadline:
+                    raise MediaUploadError(
+                        "Media processing timed out after %ds" % self._VIDEO_PROCESS_TIMEOUT
                     )
                 headers = self._build_headers(url=upload_url, method="GET")
                 resp = session.get(
@@ -992,7 +1013,7 @@ class TwitterClient:
                 except (json.JSONDecodeError, ValueError):
                     raise MediaUploadError("STATUS returned invalid JSON")
                 info = status_result.get("processing_info") if isinstance(status_result, dict) else None
-            logger.info("Media STATUS: video processing complete")
+            logger.info("Media STATUS: processing complete")
 
         return media_id
 
@@ -1188,8 +1209,8 @@ class TwitterClient:
 
     # ── Internal: timeline / user list fetchers ──────────────────────
 
-    def _fetch_timeline(self, operation_name, count, get_instructions, extra_variables=None, override_base_variables=False, field_toggles=None, use_post=False, include_promoted=False, start_cursor=None, return_cursor=False):
-        # type: (str, int, Callable[[Any], Any], Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool, bool, Optional[str], bool) -> Any
+    def _fetch_timeline(self, operation_name, count, get_instructions, extra_variables=None, override_base_variables=False, field_toggles=None, use_post=False, include_promoted=False, start_cursor=None, return_cursor=False, truncate=True):
+        # type: (str, int, Callable[[Any], Any], Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool, bool, Optional[str], bool, bool) -> Any
         """Generic timeline fetcher with pagination and deduplication.
 
         Args:
@@ -1198,9 +1219,10 @@ class TwitterClient:
                 endpoints like SearchTimeline that reject unknown variables.
             use_post: If True, send request via POST instead of GET. Required for
                 endpoints like SearchTimeline that Twitter migrated to POST.
+            truncate: If True (default), slice returned tweets to ``count``.
         """
         if count <= 0:
-            return []
+            return ([], None) if return_cursor else []
 
         # Enforce max count cap
         count = min(count, self._max_count)
@@ -1259,9 +1281,10 @@ class TwitterClient:
                 logger.debug("Sleeping %.1fs between requests", jitter)
                 time.sleep(jitter)
 
+        result_tweets = tweets[:count] if truncate else tweets
         if return_cursor:
-            return tweets[:count], continuation_cursor
-        return tweets[:count]
+            return result_tweets, continuation_cursor
+        return result_tweets
 
     def _fetch_user_list(self, operation_name, user_id, count, get_instructions, use_post=False):
         # type: (str, str, int, Callable[[Any], Any], bool) -> List[UserProfile]
@@ -1358,7 +1381,12 @@ class TwitterClient:
             if _is_stale_query_error(exc):
                 logger.info("Retrying %s with live queryId after stale-query response", operation_name)
                 _invalidate_query_id(operation_name)
-                refreshed_query_id = _resolve_query_id(operation_name, prefer_fallback=False, url_fetch_fn=_url_fetch)
+                refreshed_query_id = _resolve_query_id(
+                    operation_name,
+                    prefer_fallback=False,
+                    url_fetch_fn=_url_fetch,
+                    exclude_ids={query_id},
+                )
                 if refreshed_query_id != query_id:
                     retry_url = _build_graphql_url(refreshed_query_id, operation_name, variables, features, field_toggles)
                     return self._api_get(retry_url)
@@ -1383,7 +1411,12 @@ class TwitterClient:
             if _is_stale_query_error(exc):
                 logger.info("Retrying POST %s with live queryId after stale-query response", operation_name)
                 _invalidate_query_id(operation_name)
-                refreshed = _resolve_query_id(operation_name, prefer_fallback=False, url_fetch_fn=_url_fetch)
+                refreshed = _resolve_query_id(
+                    operation_name,
+                    prefer_fallback=False,
+                    url_fetch_fn=_url_fetch,
+                    exclude_ids={query_id},
+                )
                 if refreshed != query_id:
                     return _do_post(refreshed)
             raise
@@ -1519,7 +1552,7 @@ class TwitterClient:
         try:
             cache_path = self._ct_cache_path()
             cache_dir = os.path.dirname(cache_path)
-            os.makedirs(cache_dir, exist_ok=True)
+            os.makedirs(cache_dir, mode=0o700, exist_ok=True)
             _tighten_dir(Path(cache_dir))
             cache = {
                 "home_html": home_html,
@@ -1549,11 +1582,11 @@ class TwitterClient:
         """Initialize ClientTransaction for x-client-transaction-id header.
 
         Tries cache first (1h TTL), then fetches fresh responsive-web bootstrap
-        HTML from x.com. Since X migrated anonymous `/` and `/home` to the
-        stripped Vite `x-web` shell without `ondemand.s`, we try authenticated
-        `https://x.com/home` first and fall back to unauthenticated
-        `https://x.com/i/jf/` (which serves the responsive-web shell).
-        Also updates live feature flags from the fetched HTML.
+        HTML from x.com. Prefers unauthenticated ``https://x.com/i/jf/`` first
+        (avoids sending session cookies or caching authenticated HTML on disk)
+        and falls back to authenticated ``https://x.com/home`` if needed.
+        Validates the full ``ClientTransaction(...)`` initialization inside the
+        candidate loop so an incomplete/interstitial page cleanly falls back.
         """
         if self._ct_init_attempted:
             return
@@ -1572,52 +1605,55 @@ class TwitterClient:
             base_headers = dict(_gen_ct_headers())
             cookie_header = self._ct_bootstrap_cookie()
 
-            candidates = []
+            candidates = [("https://x.com/i/jf/", dict(base_headers), False)]
             if cookie_header:
                 auth_headers = dict(base_headers)
                 auth_headers["Cookie"] = cookie_header
-                candidates.append(("https://x.com/home", auth_headers))
-            candidates.append(("https://x.com/i/jf/", dict(base_headers)))
+                candidates.append(("https://x.com/home", auth_headers, True))
 
-            home_page = None
-            home_page_response = None
-            ondemand_url = None
-
-            for bootstrap_url, req_headers in candidates:
+            for bootstrap_url, req_headers, is_authenticated in candidates:
                 try:
                     resp = cffi_session.get(bootstrap_url, headers=req_headers, timeout=10)
+                    resp_status = getattr(resp, "status_code", 200)
+                    if isinstance(resp_status, int) and resp_status >= 400:
+                        raise ValueError("HTTP %s from %s" % (resp_status, bootstrap_url))
                     soup = bs4.BeautifulSoup(resp.content, "html.parser")
-                    url = get_ondemand_file_url(response=soup)
-                    if url:
-                        home_page = resp
-                        home_page_response = soup
-                        ondemand_url = url
-                        logger.debug("Bootstrapped ClientTransaction from %s", bootstrap_url)
-                        break
-                    last_exc = ValueError("No ondemand.s URL found at %s" % bootstrap_url)
+                    ondemand_url = get_ondemand_file_url(response=soup)
+                    if not ondemand_url:
+                        raise ValueError("No ondemand.s URL found at %s" % bootstrap_url)
+
+                    # Fetch ondemand JS bundle without session cookies (CDN asset).
+                    ondemand_file = cffi_session.get(
+                        ondemand_url, headers=base_headers, timeout=10,
+                    )
+                    ondemand_status = getattr(ondemand_file, "status_code", 200)
+                    if isinstance(ondemand_status, int) and ondemand_status >= 400:
+                        raise ValueError(
+                            "HTTP %s from %s" % (ondemand_status, ondemand_url)
+                        )
+                    ct = ClientTransaction(
+                        home_page_response=soup,
+                        ondemand_file_response=ondemand_file.text,
+                    )
+                    self._client_transaction = ct
+                    logger.info(
+                        "ClientTransaction initialized for x-client-transaction-id (via %s)",
+                        bootstrap_url,
+                    )
+                    _update_features_from_html(resp.text)
+                    # Only cache unauthenticated HTML to disk to avoid persisting
+                    # account state from authenticated /home payloads.
+                    if not is_authenticated:
+                        self._save_ct_cache(resp.text, ondemand_file.text)
+                    return
                 except Exception as exc:
                     last_exc = exc
-                    logger.debug("ClientTransaction bootstrap candidate %s failed: %s", bootstrap_url, exc)
+                    logger.debug(
+                        "ClientTransaction bootstrap candidate %s failed: %s", bootstrap_url, exc
+                    )
                     continue
 
-            if not ondemand_url or home_page is None or home_page_response is None:
-                raise last_exc or ValueError("Failed to extract ondemand file URL from x.com")
-
-            # Fetch ondemand JS bundle without session cookies (CDN asset).
-            ondemand_file = cffi_session.get(
-                ondemand_url, headers=base_headers, timeout=10,
-            )
-            self._client_transaction = ClientTransaction(
-                home_page_response=home_page_response,
-                ondemand_file_response=ondemand_file.text,
-            )
-            logger.info("ClientTransaction initialized for x-client-transaction-id")
-
-            # Try to extract live FEATURES from the bootstrap HTML
-            _update_features_from_html(home_page.text)
-
-            # Save to cache for future use
-            self._save_ct_cache(home_page.text, ondemand_file.text)
+            raise last_exc or ValueError("Failed to initialize ClientTransaction from x.com")
         except Exception as exc:
             logger.warning(
                 "Failed to init ClientTransaction: %s — x-client-transaction-id is "

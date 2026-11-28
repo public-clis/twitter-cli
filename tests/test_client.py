@@ -1717,22 +1717,22 @@ class TestClientTransactionBootstrap:
     @patch("twitter_cli.client.ClientTransaction")
     @patch("twitter_cli.client._gen_ct_headers", return_value={"Referer": "https://x.com"})
     @patch("twitter_cli.client._get_cffi_session")
-    def test_bootstraps_from_home_with_cookie(
+    def test_bootstraps_from_i_jf_without_cookie_first(
         self, mock_session, _mock_ct_headers, mock_tx, _mock_features
     ):
         import bs4
 
-        home_page = MagicMock(content=_CT_HOME_HTML.encode("utf-8"), text=_CT_HOME_HTML)
-        ondemand_page = MagicMock(text=_CT_ONDEMAND_JS)
-        mock_session.return_value.get.side_effect = [home_page, ondemand_page]
+        jf_page = MagicMock(status_code=200, content=_CT_HOME_HTML.encode("utf-8"), text=_CT_HOME_HTML)
+        ondemand_page = MagicMock(status_code=200, text=_CT_ONDEMAND_JS)
+        mock_session.return_value.get.side_effect = [jf_page, ondemand_page]
 
         client = self._make_client(cookie_string="auth_token=auth_tok; ct0=ct0_val")
         client._ensure_client_transaction()
 
         first = mock_session.return_value.get.call_args_list[0]
         second = mock_session.return_value.get.call_args_list[1]
-        assert first.args[0] == "https://x.com/home"
-        assert first.kwargs["headers"]["Cookie"] == "auth_token=auth_tok; ct0=ct0_val"
+        assert first.args[0] == "https://x.com/i/jf/"
+        assert "Cookie" not in first.kwargs["headers"]
         assert second.args[0] == (
             "https://abs.twimg.com/responsive-web/client-web/"
             "ondemand.s.38289b77fa31a72ca.js"
@@ -1741,31 +1741,36 @@ class TestClientTransactionBootstrap:
         assert "Cookie" not in second.kwargs["headers"]
         mock_tx.assert_called_once()
         assert isinstance(mock_tx.call_args.kwargs["home_page_response"], bs4.BeautifulSoup)
+        client._save_ct_cache.assert_called_once()
 
     @patch("twitter_cli.client._update_features_from_html")
     @patch("twitter_cli.client.ClientTransaction")
     @patch("twitter_cli.client._gen_ct_headers", return_value={"Referer": "https://x.com"})
     @patch("twitter_cli.client._get_cffi_session")
-    def test_falls_back_to_i_jf_when_home_lacks_ondemand(
+    def test_falls_back_to_authenticated_home_when_i_jf_fails_without_caching_auth_html(
         self, mock_session, _mock_ct_headers, mock_tx, _mock_features
     ):
-        stripped = MagicMock(content=_CT_STRIPPED_HTML.encode("utf-8"), text=_CT_STRIPPED_HTML)
-        jf_page = MagicMock(content=_CT_HOME_HTML.encode("utf-8"), text=_CT_HOME_HTML)
-        ondemand_page = MagicMock(text=_CT_ONDEMAND_JS)
-        mock_session.return_value.get.side_effect = [stripped, jf_page, ondemand_page]
+        stripped = MagicMock(status_code=200, content=_CT_STRIPPED_HTML.encode("utf-8"), text=_CT_STRIPPED_HTML)
+        home_page = MagicMock(status_code=200, content=_CT_HOME_HTML.encode("utf-8"), text=_CT_HOME_HTML)
+        ondemand_page = MagicMock(status_code=200, text=_CT_ONDEMAND_JS)
+        mock_session.return_value.get.side_effect = [stripped, home_page, ondemand_page]
 
-        client = self._make_client(cookie_string=None)
+        client = self._make_client(cookie_string="auth_token=auth_tok; ct0=ct0_val")
         client._ensure_client_transaction()
 
         calls = mock_session.return_value.get.call_args_list
-        assert calls[0].args[0] == "https://x.com/home"
-        assert calls[1].args[0] == "https://x.com/i/jf/"
-        assert "Cookie" not in calls[1].kwargs["headers"]
+        assert calls[0].args[0] == "https://x.com/i/jf/"
+        assert "Cookie" not in calls[0].kwargs["headers"]
+        assert calls[1].args[0] == "https://x.com/home"
+        assert calls[1].kwargs["headers"]["Cookie"] == "auth_token=auth_tok; ct0=ct0_val"
         assert calls[2].args[0] == (
             "https://abs.twimg.com/responsive-web/client-web/"
             "ondemand.s.38289b77fa31a72ca.js"
         )
+        assert "Cookie" not in calls[2].kwargs["headers"]
         mock_tx.assert_called_once()
+        # Authenticated /home HTML must not be persisted to disk.
+        client._save_ct_cache.assert_not_called()
 
     def test_real_parser_resolves_ondemand_from_current_layout(self):
         import bs4
@@ -2067,12 +2072,11 @@ class TestUploadVideo:
     @patch("twitter_cli.client._get_cffi_session")
     def test_upload_video_chunks_and_polls_status(self, mock_session, _mock_sleep, tmp_path):
         vid = tmp_path / "clip.mp4"
-        # 5 MB -> 2 chunks (4 MB + 1 MB)
+        # 5 MB -> 3 chunks (2 MB + 2 MB + 1 MB) staying under X's 5 MB base64 segment cap
         vid.write_bytes(b"\x00" * (5 * 1024 * 1024))
 
         resp_init = MagicMock(status_code=200, text='{"media_id_string": "vid-999"}')
-        resp_append0 = MagicMock(status_code=204, text="")
-        resp_append1 = MagicMock(status_code=204, text="")
+        resp_append = MagicMock(status_code=204, text="")
         resp_finalize = MagicMock(
             status_code=200,
             text='{"media_id_string": "vid-999", "processing_info": {"state": "pending", "check_after_secs": 1}}',
@@ -2083,7 +2087,9 @@ class TestUploadVideo:
         )
 
         sess = MagicMock()
-        sess.post = MagicMock(side_effect=[resp_init, resp_append0, resp_append1, resp_finalize])
+        sess.post = MagicMock(
+            side_effect=[resp_init, resp_append, resp_append, resp_append, resp_finalize]
+        )
         sess.get = MagicMock(return_value=resp_status)
         mock_session.return_value = sess
 
@@ -2091,9 +2097,13 @@ class TestUploadVideo:
         media_id = client.upload_media(str(vid))
 
         assert media_id == "vid-999"
-        assert sess.post.call_count == 4
-        assert sess.post.call_args_list[0].kwargs["data"]["media_category"] == "tweet_video"
+        assert sess.post.call_count == 5
+        post_datas = [c.kwargs["data"] for c in sess.post.call_args_list]
+        assert [d["command"] for d in post_datas] == ["INIT", "APPEND", "APPEND", "APPEND", "FINALIZE"]
+        assert post_datas[0]["media_category"] == "tweet_video"
+        assert [d["segment_index"] for d in post_datas[1:4]] == ["0", "1", "2"]
         assert sess.get.call_count == 1
+        assert sess.get.call_args.kwargs["params"] == {"command": "STATUS", "media_id": "vid-999"}
 
     @patch("twitter_cli.client.time.sleep")
     @patch("twitter_cli.client._get_cffi_session")
@@ -2117,7 +2127,7 @@ class TestUploadVideo:
         mock_session.return_value = sess
 
         client = self._make_client()
-        with pytest.raises(MediaUploadError, match="Video processing failed"):
+        with pytest.raises(MediaUploadError, match="Media processing failed"):
             client.upload_media(str(vid))
 
 

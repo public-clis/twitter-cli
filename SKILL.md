@@ -2,7 +2,7 @@
 name: twitter-cli
 description: Use twitter-cli for ALL Twitter/X operations — reading tweets, posting, replying, quoting, liking, retweeting, following, searching, user lookups. Invoke whenever user requests any Twitter interaction.
 author: jackwener
-version: "0.8.0"
+version: "0.8.6"
 tags:
   - twitter
   - x
@@ -32,7 +32,7 @@ uv tool upgrade twitter-cli
 
 **IMPORTANT FOR AGENTS**: Before executing ANY twitter-cli command, you MUST first check if credentials exist. If not, you MUST proactively guide the user through the authentication process. Do NOT assume credentials are configured.
 
-**CRITICAL**: Write operations (posting tweets, replying, quoting) REQUIRE full browser cookies. Only providing `auth_token` + `ct0` via env vars may result in **226 error** ("looks like automated behavior"). For best results, use browser cookie extraction.
+**CRITICAL**: Write operations (posting tweets, replying, quoting) REQUIRE full browser cookies. Only providing `auth_token` + `ct0` via env vars may result in **226 error** ("looks like automated behavior"). For best results, use browser cookie extraction or `TWITTER_COOKIE_STRING` (full `Cookie:` header).
 
 ### Step 0: Check if already authenticated
 
@@ -88,7 +88,7 @@ If asking the user to copy it:
 | Symptom | Agent action |
 |---------|-------------|
 | `No Twitter cookies found` | Guide user to login to x.com in browser, or set env vars |
-| Read works, write returns 226 | Full cookies missing — use browser cookie extraction instead of env vars |
+| Read works, write returns 226 | Full cookies missing — use browser cookie extraction or `TWITTER_COOKIE_STRING` instead of minimal `auth_token`/`ct0` env vars |
 | `Cookie expired (401/403)` | Ask user to re-login to x.com and retry |
 | User changed password | All old cookies invalidated — re-extract |
 
@@ -106,7 +106,7 @@ Non-TTY stdout defaults to YAML automatically. Use `OUTPUT=yaml|json|rich|auto` 
 
 ```bash
 twitter feed --yaml
-twitter feed --json | jq '.[0].text'
+twitter feed --json | jq '.data[0].text'
 ```
 
 All machine-readable output uses the envelope documented in [SCHEMA.md](./SCHEMA.md).
@@ -269,7 +269,7 @@ done
 ### Get user info then follow
 
 ```bash
-twitter user targethandle --json | jq '.data | {username, followers, bio}'
+twitter user targethandle --json | jq '.data | {screenName, followers, bio}'
 twitter follow targethandle
 ```
 
@@ -282,8 +282,8 @@ twitter user-posts elonmusk --max 20 --json | jq '.data | sort_by(.metrics.likes
 ### Check follower relationship
 
 ```bash
-MY_NAME=$(twitter whoami --json | jq -r '.data.user.username')
-twitter followers "$MY_NAME" --max 200 --json | jq -r '.data[].username' | grep -q "targetuser" && echo "Yes" || echo "No"
+MY_NAME=$(twitter whoami --json | jq -r '.data.user.screenName')
+twitter followers "$MY_NAME" --max 200 --json | jq -r '.data[].screenName' | grep -q "targetuser" && echo "Yes" || echo "No"
 ```
 
 ### Daily reading workflow
@@ -329,12 +329,12 @@ twitter bookmarks --filter
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `No Twitter cookies found` | Not authenticated | Login to x.com in browser, or set env vars |
-| HTTP 226 | Automated detection | Use browser cookie extraction (not env vars) |
+| HTTP 226 | Automated detection | Use browser cookie extraction or full `TWITTER_COOKIE_STRING` |
 | HTTP 401/403 | Cookie expired | Re-login to x.com and retry |
-| HTTP 404 | QueryId rotation | Retry (auto-fallback built in) |
+| HTTP 404 | QueryId rotation | Retry (auto-fallback built in) or run `twitter doctor --refresh` |
 | HTTP 429 | Rate limited | Wait 15+ minutes, then retry |
 | Error 187 | Duplicate tweet | Change text content |
-| Error 186 | Tweet too long | Keep under 280 chars |
+| Error 186 | Tweet too long | Keep under 280 weighted chars (or use X Premium, which auto-routes via `CreateNoteTweet`) |
 
 ## Limitations
 

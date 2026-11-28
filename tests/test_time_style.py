@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import io
+
 import pytest
 from rich.console import Console
 
 from twitter_cli import formatter
 from twitter_cli.formatter import (
     get_time_style,
+    print_article,
     print_tweet_detail,
     print_tweet_table,
     set_time_style,
@@ -24,11 +27,13 @@ def _tweet() -> Tweet:
         author=Author(id="u1", name="Alice", screen_name="alice"),
         metrics=Metrics(likes=1, retweets=0, replies=0, quotes=0, views=10, bookmarks=0),
         created_at=CREATED_AT,
+        article_title="My Article",
+        article_text="Body",
     )
 
 
 def _render(printer) -> str:
-    console = Console(record=True, width=120, file=None)
+    console = Console(record=True, width=120, file=io.StringIO())
     printer(console)
     return console.export_text()
 
@@ -40,10 +45,11 @@ def _restore_style():
     formatter.set_time_style(original)
 
 
-def test_relative_style_renders_ago() -> None:
+def test_relative_style_renders_ago(monkeypatch) -> None:
+    monkeypatch.setattr(formatter, "format_relative_time", lambda _s: "3d ago")
     set_time_style("relative")
     text = _render(lambda c: print_tweet_table([_tweet()], console=c))
-    assert "ago" in text
+    assert "3d ago" in text
 
 
 def test_absolute_style_renders_datetime() -> None:
@@ -53,10 +59,10 @@ def test_absolute_style_renders_datetime() -> None:
     assert ":" in text
 
 
-def test_iso_style_renders_iso8601() -> None:
+def test_iso_style_renders_full_iso8601_without_truncation() -> None:
     set_time_style("iso")
     text = _render(lambda c: print_tweet_table([_tweet()], console=c))
-    assert "2026-03-14T" in text
+    assert "2026-03-14T21:08:00+00:00" in text
     assert "ago" not in text
 
 
@@ -64,7 +70,19 @@ def test_detail_view_does_not_repeat_stamp_under_absolute() -> None:
     set_time_style("absolute")
     text = _render(lambda c: print_tweet_detail(_tweet(), console=c))
     assert "ago" not in text
-    assert "2026-03-" in text
+    assert text.count("2026-03-") == 1
+
+
+def test_article_view_respects_time_style() -> None:
+    set_time_style("iso")
+    text = _render(lambda c: print_article(_tweet(), console=c))
+    assert "2026-03-14T21:08:00+00:00" in text
+
+
+def test_set_time_style_none_resets_to_relative() -> None:
+    set_time_style("iso")
+    assert set_time_style(None) == "relative"
+    assert get_time_style() == "relative"
 
 
 def test_invalid_style_is_ignored() -> None:

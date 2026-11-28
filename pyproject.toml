@@ -41,9 +41,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jackwener/twitter-cli"
-Repository = "https://github.com/jackwener/twitter-cli"
-Issues = "https://github.com/jackwener/twitter-cli/issues"
+Homepage = "https://github.com/public-clis/twitter-cli"
+Repository = "https://github.com/public-clis/twitter-cli"
+Issues = "https://github.com/public-clis/twitter-cli/issues"
 
 [project.scripts]
 twitter = "twitter_cli.cli:cli"

@@ -29,7 +29,7 @@ error:
 - tweet and user lists are returned under `data`
 - timeline-style list commands (`feed`, `bookmarks`, `list`, `tweet`) may also return `pagination.nextCursor`
 - `article` returns a single tweet object under `data`
-- `news` returns a list of Explore News story objects (`id`, `headline`, `category`, `timeAgo`, `postCount`, `summary`, `hook`, `keywords`, `tweetIds`, `url`) under `data`
+- `news` returns a list of Explore News story objects (`rank`, `title`, `name`, `category`, `context`, `query`, `url`, `post_count`, `trend_id`, `is_ai_trend`, `type`) under `data`
 - `doctor` returns `data.checks` (metadata only — never emits cookies or tokens)
 - `status` returns `data.authenticated` plus `data.user`
 - `whoami` returns `data.user`
