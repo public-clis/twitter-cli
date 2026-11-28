@@ -16,6 +16,9 @@ DEFAULT_CONFIG: Dict[str, Dict[str, Any]] = {
     "fetch": {
         "count": 50,
     },
+    "display": {
+        "time": "relative",
+    },
     "filter": {
         "mode": "topN",
         "topN": 20,
@@ -74,6 +77,7 @@ def _resolve_config_path(config_path: Optional[str]) -> Optional[Path]:
 
     candidates = [
         Path.cwd() / "config.yaml",
+        Path.home() / ".twitter-cli" / "config.yaml",
         Path(__file__).parent.parent / "config.yaml",
     ]
     for candidate in candidates:
@@ -104,6 +108,15 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     fetch_count = _as_int(fetch.get("count"), DEFAULT_CONFIG["fetch"]["count"])
     fetch["count"] = max(fetch_count, 1)
     merged["fetch"] = fetch
+
+    display = merged.get("display")
+    if not isinstance(display, dict):
+        display = {}
+    time_style = str(display.get("time", "relative")).strip().lower()
+    if time_style not in {"relative", "absolute", "iso"}:
+        time_style = "relative"
+    display["time"] = time_style
+    merged["display"] = display
 
     filter_config = merged.get("filter")
     if not isinstance(filter_config, dict):

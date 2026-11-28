@@ -1,6 +1,6 @@
 # twitter-cli
 
-[![CI](https://github.com/jackwener/twitter-cli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jackwener/twitter-cli/actions/workflows/ci.yml)
+[![CI](https://github.com/public-clis/twitter-cli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/public-clis/twitter-cli/actions/workflows/ci.yml)
 [![PyPI version](https://badge.fury.io/py/twitter-cli.svg)](https://pypi.org/project/twitter-cli/)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue.svg)](https://pypi.org/project/twitter-cli/)
 
@@ -21,22 +21,26 @@ A terminal-first CLI for Twitter/X: read timelines, bookmarks, and user profiles
 
 **Read:**
 - Timeline: fetch `for-you` and `following` feeds
-- Bookmarks: list saved tweets from your account
-- Search: find tweets by keyword with Top/Latest/Photos/Videos tabs
-- Tweet detail: view a tweet and its replies; use `show <N>` to open tweet #N from the last list output
-- Article: fetch a Twitter Article and export it as Markdown
+- Bookmarks: list saved tweets (with `--cursor` pagination and bookmark folders)
+- Explore News: fetch personalized stories from Explore > News (`twitter news`)
+- Search: find tweets by keyword with Top/Latest/Photos/Videos tabs and advanced filters
+- Tweet detail: view a tweet and its replies (with `--cursor` pagination); use `show <N>` to open tweet #N from the last list output
+- Article: fetch a Twitter Article with rich Draft.js formatting (Markdown blocks, links, inline styles, embedded tweets) and export as Markdown
 - List timeline: fetch tweets from a Twitter List
-- User lookup: fetch user profile, tweets, likes, followers, and following
-- `--full-text`: disable tweet text truncation in rich table output
+- User lookup: fetch user profile (by `@handle` or numeric user ID), tweets, likes, followers, and following
+- Display controls: `--full-text` for untruncated tables, `--time relative|absolute|iso` for timestamps, `completion bash|zsh|fish`, and `doctor [--refresh]`
 - Structured output: export any data as YAML or JSON for scripting and AI agent integration
 - Optional scoring filter: rank tweets by engagement weights
+- Python library API: import `TwitterClient`, `get_cookies`, models, and serializers directly from `twitter_cli`
 - Structured output contract: [SCHEMA.md](./SCHEMA.md)
 
 > **AI Agent Tip:** Prefer `--yaml` for structured output unless a strict JSON parser is required. Non-TTY stdout defaults to YAML automatically. Use `--max` to limit results.
 
 **Write:**
-- Post: create new tweets and replies, with optional image attachments (up to 4)
-- Quote: quote-tweet with optional images
+- Post: create new tweets and replies, with optional images (up to 4) or video (`--video` / `-V`, MP4/MOV/WebM up to 512 MB)
+- Long-form posts: tweets over 280 weighted characters automatically route to `CreateNoteTweet` (X Premium)
+- Article publish: publish X Articles (or drafts) directly from Markdown (`twitter article-publish`)
+- Quote: quote-tweet with optional images or video
 - Delete: remove your own tweets
 - Like / Unlike: manage tweet likes
 - Retweet / Unretweet: manage retweets
@@ -44,12 +48,12 @@ A terminal-first CLI for Twitter/X: read timelines, bookmarks, and user profiles
 - Write commands also support explicit `--json` / `--yaml` output now
 
 **Auth & Anti-Detection:**
-- Cookie auth: use browser cookies or environment variables
+- Cookie auth: browser cookies (Arc, Chrome, Edge, Firefox, Brave, Vivaldi, Zen, custom Chromium dir) or env vars (`TWITTER_COOKIE_STRING` or `TWITTER_AUTH_TOKEN` + `TWITTER_CT0`)
 - Full cookie forwarding: extracts ALL browser cookies for richer browser context
 - TLS fingerprint impersonation: `curl_cffi` with dynamic Chrome version matching
-- `x-client-transaction-id` header generation
-- Request timing jitter to avoid pattern detection
-- Write operation delays (1.5–4s random) to mitigate rate limits
+- `x-client-transaction-id` header generation with fail-closed protection on unsigned `POST` mutations
+- Self-healing GraphQL `queryId` resolution with 24h local cache and `TWITTER_QID_<OP>` overrides
+- Request timing jitter and write delays (1.5–4s random) to mitigate rate limits
 - Proxy support via `TWITTER_PROXY` environment variable
 
 ### Installation
@@ -74,7 +78,7 @@ uv tool upgrade twitter-cli
 Install from source:
 
 ```bash
-git clone git@github.com:jackwener/twitter-cli.git
+git clone git@github.com:public-clis/twitter-cli.git
 cd twitter-cli
 uv sync
 ```
@@ -105,8 +109,13 @@ twitter feed --json                    # Structured stdout for scripts/agents
 
 # Bookmarks
 twitter bookmarks
+twitter bookmarks --cursor "<next-cursor-from-previous-response>"
 twitter bookmarks --full-text
 twitter bookmarks --max 30 --yaml
+
+# Explore News
+twitter news --max 20
+twitter news --json
 
 # Search
 twitter search "Claude Code"
@@ -120,6 +129,7 @@ twitter search "trending" --filter              # Apply ranking filter
 
 # Tweet detail (view tweet + replies)
 twitter tweet 1234567890
+twitter tweet 1234567890 --cursor "<next-cursor>"
 twitter tweet 1234567890 --full-text
 twitter tweet https://x.com/user/status/1234567890
 
@@ -128,19 +138,22 @@ twitter show 2                         # Open tweet #2 from last feed/search
 twitter show 2 --full-text             # Full text in reply table
 twitter show 2 --json                  # Structured output
 
-# Twitter Article
+# Twitter Article (read & publish)
 twitter article 1234567890
 twitter article https://x.com/user/article/1234567890 --json
 twitter article 1234567890 --markdown
 twitter article 1234567890 --output article.md
+twitter article-publish post.md --title "My Article"          # Publish X Article
+twitter article-publish post.md --title "My Draft" --draft    # Save as draft
 
 # List timeline
 twitter list 1539453138322673664
 twitter list 1539453138322673664 --cursor "<next-cursor-from-previous-response>"
 twitter list 1539453138322673664 --full-text
 
-# User
+# User (accepts @handle or numeric user ID)
 twitter user elonmusk
+twitter user 44196397
 twitter user-posts elonmusk --max 20
 twitter user-posts elonmusk --full-text
 twitter user-posts elonmusk -o tweets.json
@@ -154,6 +167,7 @@ twitter following elonmusk --max 50
 twitter post "Hello from twitter-cli!"
 twitter post "Hello!" --image photo.jpg            # Post with image
 twitter post "Gallery" -i a.png -i b.jpg -i c.webp  # Up to 4 images
+twitter post "Demo clip" --video clip.mp4          # Post with video (up to 512 MB)
 twitter post "reply text" --reply-to 1234567890
 twitter reply 1234567890 "Nice!" -i screenshot.png  # Reply with image
 twitter quote 1234567890 "Look" -i chart.png        # Quote with image
@@ -167,16 +181,39 @@ twitter unretweet 1234567890
 twitter bookmark 1234567890
 twitter unbookmark 1234567890
 twitter follow elonmusk --json
+
+# Display, completion & diagnostics
+twitter --time relative feed           # relative | absolute | iso
+twitter completion zsh                 # bash | zsh | fish
+twitter doctor                         # Check deps, config, auth presence, caches
+twitter doctor --refresh               # Refresh cached GraphQL query IDs
+```
+
+### Python Library Usage
+
+```python
+from twitter_cli import TwitterClient, get_cookies
+
+cookies = get_cookies()
+client = TwitterClient(
+    cookies["auth_token"],
+    cookies["ct0"],
+    cookie_string=cookies.get("cookie_string"),
+)
+tweets = client.fetch_home_timeline(count=20)
+for tweet in tweets:
+    print(f"@{tweet.author.screen_name}: {tweet.text[:80]}")
 ```
 
 ### Authentication
 
 twitter-cli uses this auth priority:
 
-1. **Environment variables**: `TWITTER_AUTH_TOKEN` + `TWITTER_CT0`
-2. **Browser cookies** (recommended): auto-extract from Arc/Chrome/Edge/Firefox/Brave
+1. **Full cookie string**: `TWITTER_COOKIE_STRING` (full `Cookie:` header; auto-extracts `auth_token` + `ct0` while keeping all session cookies — great for remote servers, SigCLI, or Windows Chrome >=127)
+2. **Environment variables**: `TWITTER_AUTH_TOKEN` + `TWITTER_CT0`
+3. **Browser cookies** (recommended locally): auto-extract from Arc, Chrome, Edge, Firefox, Brave, Vivaldi, or Zen
 
-Browser extraction is recommended — it forwards ALL Twitter cookies (not just `auth_token` + `ct0`) and aligns request headers with your local runtime, which is closer to normal browser traffic than minimal cookie auth.
+Browser extraction is recommended locally — it forwards ALL Twitter cookies (not just `auth_token` + `ct0`) and aligns request headers with your local runtime, which is closer to normal browser traffic than minimal cookie auth.
 
 **Chrome multi-profile**: All Chrome profiles are scanned automatically. To specify a profile:
 
@@ -184,13 +221,23 @@ Browser extraction is recommended — it forwards ALL Twitter cookies (not just 
 TWITTER_CHROME_PROFILE="Profile 2" twitter feed
 ```
 
+**Custom Chromium directory:** For Chromium, Opera, Brave/Chrome custom data dirs, or portable builds:
+
+```bash
+TWITTER_CHROMIUM_USER_DATA_DIR="/path/to/User Data" twitter feed
+```
+
 **Browser priority:** If you have multiple browsers, set `TWITTER_BROWSER` to try a specific browser first:
 
 ```bash
-TWITTER_BROWSER=chrome twitter feed    # Supported: arc, chrome, edge, firefox, brave
+TWITTER_BROWSER=chrome twitter feed    # Supported: arc, chrome, edge, firefox, brave, vivaldi, zen
 ```
 
 After loading cookies, the CLI performs lightweight verification. Commands that require account access fail fast on clear auth errors (`401/403`).
+
+**Advanced GraphQL & Transaction env vars:**
+- `TWITTER_QID_<OPERATION>=<queryId>` — override a specific GraphQL queryId (e.g. `TWITTER_QID_HomeTimeline=...`)
+- `TWITTER_ALLOW_UNSIGNED=1` — opt-in bypass if `x-client-transaction-id` cannot be generated on write (`POST`) requests (fails closed by default to prevent 226 anti-bot flags)
 
 ### Proxy Support
 
@@ -208,11 +255,14 @@ Using a proxy can help reduce IP-based rate limiting risks.
 
 ### Configuration
 
-Create `config.yaml` in your working directory:
+Create `config.yaml` in your working directory or `~/.twitter-cli/config.yaml` (search order: explicit path → `./config.yaml` → `~/.twitter-cli/config.yaml` → built-in defaults):
 
 ```yaml
 fetch:
   count: 50
+
+display:
+  time: "relative"      # "relative" | "absolute" | "iso"
 
 filter:
   mode: "topN"          # "topN" | "score" | "all"
@@ -231,7 +281,7 @@ rateLimit:
   requestDelay: 2.5     # base delay between requests (randomized ×0.7–1.5)
   maxRetries: 3          # retry count on rate limit (429)
   retryBaseDelay: 5.0    # base delay for exponential backoff
-  maxCount: 200          # hard cap on fetched items
+  maxCount: 200          # default pagination cap (explicit --max can exceed up to 10,000)
 ```
 
 Fetch behavior:
@@ -278,9 +328,9 @@ Mode behavior:
 ### Troubleshooting
 
 - `No Twitter cookies found`
-  - Ensure you are logged in to `x.com` in a supported browser (Arc/Chrome/Edge/Firefox/Brave).
-  - Or set `TWITTER_AUTH_TOKEN` and `TWITTER_CT0` manually.
-  - Run with `-v` to see browser extraction diagnostics.
+  - Ensure you are logged in to `x.com` in a supported browser (Arc/Chrome/Edge/Firefox/Brave/Vivaldi/Zen) or point to a custom directory with `TWITTER_CHROMIUM_USER_DATA_DIR`.
+  - Or set `TWITTER_COOKIE_STRING` (recommended for headless/Windows Chrome >=127) or `TWITTER_AUTH_TOKEN` + `TWITTER_CT0` manually.
+  - Run with `-v` or `twitter doctor` to see diagnostics.
 
 - `Cookie expired or invalid (HTTP 401/403)`
   - Re-login to `x.com` and retry.
@@ -308,7 +358,7 @@ Mode behavior:
 
 
 
-Structured error codes commonly include `not_authenticated`, `not_found`, `invalid_input`, `rate_limited`, and `api_error`.
+Structured error codes commonly include `not_authenticated`, `not_found`, `invalid_input`, `rate_limited`, `network_error`, `query_id_error`, `media_upload_error`, and `api_error`.
 
 ### Development
 
@@ -321,26 +371,31 @@ uv run ruff check .
 uv run pytest -q
 ```
 
-Current CI validates the project on Python 3.8, 3.10, and 3.12.
+Current CI validates the project on Python 3.10, 3.11, 3.12, and 3.13.
 
 ### Project Structure
 
 ```text
 twitter_cli/
-├── __init__.py
-├── cli.py
-├── client.py
-├── graphql.py       # GraphQL query IDs, URL building, JS bundle scanning
-├── parser.py        # Tweet, User, Media parsing logic
-├── auth.py
-├── config.py
+├── __init__.py      # Public Python library exports
+├── article.py       # Markdown -> Draft.js content_state builder for X Articles
+├── auth.py          # Browser cookie extraction & env auth
+├── cache.py         # Owner-only local cache helpers
+├── cli.py           # Click CLI commands
+├── client.py        # HTTP/GraphQL/media client & ClientTransaction bootstrap
+├── config.py        # YAML configuration loader
 ├── constants.py
 ├── exceptions.py
 ├── filter.py
 ├── formatter.py
+├── graphql.py       # GraphQL query IDs, disk cache, live JS bundle scanning
+├── models.py
 ├── output.py
+├── parser.py        # Tweet, User, Media, Article Draft.js parsing
+├── search.py        # Advanced search query builder
 ├── serialization.py
-└── models.py
+├── text.py          # twitter-text v3 weighted character length
+└── timeutil.py
 ```
 
 ### Use as AI Agent Skill
@@ -350,7 +405,7 @@ twitter-cli ships with a [`SKILL.md`](./SKILL.md) so AI agents can execute commo
 #### [Skills CLI](https://github.com/vercel-labs/skills) (Recommended)
 
 ```bash
-npx skills add jackwener/twitter-cli
+npx skills add public-clis/twitter-cli
 ```
 
 | Flag | Description |
@@ -363,7 +418,7 @@ npx skills add jackwener/twitter-cli
 
 ```bash
 mkdir -p .agents/skills
-git clone git@github.com:jackwener/twitter-cli.git .agents/skills/twitter-cli
+git clone git@github.com:public-clis/twitter-cli.git .agents/skills/twitter-cli
 ```
 
 #### ~~OpenClaw / ClawHub~~ (Deprecated)
@@ -376,20 +431,24 @@ git clone git@github.com:jackwener/twitter-cli.git .agents/skills/twitter-cli
 
 **读取:**
 - 时间线读取：支持 `for-you` 和 `following`
-- 收藏读取：查看账号书签推文
-- 搜索：按关键词搜索推文，支持 Top/Latest/Photos/Videos
-- 推文详情：查看推文及其回复；用 `show <N>` 可直接打开上次列表里的第 N 条推文
-- 文章读取：获取 Twitter 长文，并导出为 Markdown
+- 收藏读取：查看账号书签推文（支持 `--cursor` 翻页及书签文件夹）
+- Explore 新闻：`twitter news` 获取个性化新闻摘要
+- 搜索：按关键词搜索推文，支持 Top/Latest/Photos/Videos 与高级过滤
+- 推文详情：查看推文及其回复（支持 `--cursor` 翻页）；用 `show <N>` 可直接打开上次列表里的第 N 条推文
+- 文章读取：获取 Twitter 长文（完整保留 Draft.js Markdown/链接/行内样式/嵌入推文），并导出为 Markdown
 - 列表时间线：获取 Twitter List 的推文
-- 用户查询：查看用户资料、推文、点赞、粉丝和关注
-- `--full-text`：在 rich table 输出里关闭推文正文截断
+- 用户查询：支持 `@handle` 或纯数字 user ID 查询资料、推文、点赞、粉丝和关注
+- 展示与工具：`--full-text` 关闭正文截断、`--time relative|absolute|iso` 控制时间格式、`completion bash|zsh|fish`、`doctor [--refresh]`
 - 结构化输出：支持 YAML 和 JSON，便于脚本处理和 AI agent 集成
+- Python 库 API：可直接 `from twitter_cli import TwitterClient, get_cookies` 调用
 
 > **AI Agent 提示：** 需要结构化输出时优先使用 `--yaml`，除非下游必须是 JSON。stdout 不是 TTY 时默认输出 YAML。用 `--max` 控制返回数量。
 
 **写入:**
-- 发推：发布新推文和回复，支持附带图片（最多 4 张，支持 JPEG/PNG/GIF/WebP）
-- 引用推文：带评论的转发，也支持附带图片
+- 发推：发布新推文和回复，支持附带图片（最多 4 张）或视频（`--video` / `-V`，MP4/MOV/WebM，最大 512 MB）
+- 长推文自动适配：超过 280 加权字符时自动切换 `CreateNoteTweet`（需 X Premium）
+- 长文发布：`twitter article-publish` 直接从 Markdown 发布 X Article 或保存草稿
+- 引用推文：带评论的转发，支持附带图片或视频
 - 删除：删除自己的推文
 - 点赞 / 取消点赞
 - 转推 / 取消转推
@@ -397,12 +456,12 @@ git clone git@github.com:jackwener/twitter-cli.git .agents/skills/twitter-cli
 - 写操作现在也显式支持 `--json` / `--yaml`
 
 **认证与反风控:**
-- Cookie 认证：支持环境变量和浏览器自动提取
+- Cookie 认证：支持环境变量（`TWITTER_COOKIE_STRING` 或 `TWITTER_AUTH_TOKEN` + `TWITTER_CT0`）和浏览器自动提取（Arc/Chrome/Edge/Firefox/Brave/Vivaldi/Zen 及自定义 Chromium 目录）
 - 完整 Cookie 转发：提取浏览器中所有 Twitter Cookie，保留更多浏览器上下文
 - TLS 指纹伪装：`curl_cffi` 动态匹配 Chrome 版本
-- `x-client-transaction-id` 请求头生成
-- 请求时序随机化（jitter）
-- 写操作随机延迟（1.5–4 秒），降低频率风控
+- `x-client-transaction-id` 请求头生成，写操作缺失签名时默认 fail-closed 拦截以防 226 风控
+- GraphQL `queryId` 24 小时本地缓存、实时 bundle 刷新与 `TWITTER_QID_<OP>` 覆盖
+- 请求时序随机化（jitter）与写操作随机延迟（1.5–4 秒），降低频率风控
 - 代理支持：`TWITTER_PROXY` 环境变量
 
 ### 安装
@@ -433,7 +492,11 @@ twitter feed --cursor "<上一页返回的 nextCursor>"
 
 # 收藏
 twitter bookmarks
+twitter bookmarks --cursor "<上一页返回的 nextCursor>"
 twitter bookmarks --full-text
+
+# Explore 新闻
+twitter news --max 20
 
 # 搜索
 twitter search "Claude Code"
@@ -444,6 +507,7 @@ twitter search "trending" --filter              # 启用排序筛选
 
 # 推文详情
 twitter tweet 1234567890
+twitter tweet 1234567890 --cursor "<nextCursor>"
 twitter tweet 1234567890 --full-text
 
 # 通过序号打开上次列表里的推文
@@ -451,19 +515,22 @@ twitter show 2                         # 打开上次 feed/search 的第 2 条
 twitter show 2 --full-text             # 在回复表格里显示完整正文
 twitter show 2 --json                  # 结构化输出
 
-# Twitter 长文
+# Twitter 长文（读取与发布）
 twitter article 1234567890
 twitter article https://x.com/user/article/1234567890 --json
 twitter article 1234567890 --markdown
 twitter article 1234567890 --output article.md
+twitter article-publish post.md --title "我的长文"
+twitter article-publish post.md --title "草稿标题" --draft
 
 # 列表时间线
 twitter list 1539453138322673664
 twitter list 1539453138322673664 --cursor "<上一页返回的 nextCursor>"
 twitter list 1539453138322673664 --full-text
 
-# 用户
+# 用户（支持 @handle 或纯数字 ID）
 twitter user elonmusk
+twitter user 44196397
 twitter user-posts elonmusk --max 20
 twitter user-posts elonmusk --full-text
 twitter user-posts elonmusk -o tweets.json
@@ -477,6 +544,7 @@ twitter following elonmusk
 twitter post "你好，世界！"
 twitter post "发图" --image photo.jpg              # 带图发推
 twitter post "多图" -i a.png -i b.jpg -i c.webp    # 最多 4 张图片
+twitter post "发视频" --video clip.mp4             # 带视频发推（最大 512 MB）
 twitter post "回复内容" --reply-to 1234567890
 twitter reply 1234567890 "回复" -i screenshot.png   # 带图回复
 twitter quote 1234567890 "评论" -i chart.png        # 带图引用
@@ -490,14 +558,37 @@ twitter unretweet 1234567890
 twitter bookmark 1234567890
 twitter unbookmark 1234567890
 twitter follow elonmusk --json
+
+# 展示、补全与诊断
+twitter --time relative feed           # relative | absolute | iso
+twitter completion zsh                 # bash | zsh | fish
+twitter doctor                         # 检查依赖、配置、认证状态与缓存
+twitter doctor --refresh               # 检查环境并刷新 GraphQL queryId 缓存
+```
+
+### Python 库调用
+
+```python
+from twitter_cli import TwitterClient, get_cookies
+
+cookies = get_cookies()
+client = TwitterClient(
+    cookies["auth_token"],
+    cookies["ct0"],
+    cookie_string=cookies.get("cookie_string"),
+)
+tweets = client.fetch_home_timeline(count=20)
+for tweet in tweets:
+    print(f"@{tweet.author.screen_name}: {tweet.text[:80]}")
 ```
 
 ### 认证说明
 
 认证优先级：
 
-1. **环境变量**：`TWITTER_AUTH_TOKEN` + `TWITTER_CT0`
-2. **浏览器提取**（推荐）：Arc/Chrome/Edge/Firefox/Brave 全量 Cookie 提取
+1. **完整 Cookie 字符串**：`TWITTER_COOKIE_STRING`（完整 `Cookie:` 请求头，自动解析 `auth_token` + `ct0` 并保留全部会话 Cookie，适合云端/Windows Chrome >=127）
+2. **环境变量**：`TWITTER_AUTH_TOKEN` + `TWITTER_CT0`
+3. **浏览器提取**（本地推荐）：Arc/Chrome/Edge/Firefox/Brave/Vivaldi/Zen 全量 Cookie 提取
 
 推荐使用浏览器提取方式，会转发所有 Twitter Cookie，并按本机运行环境生成语言和平台请求头；它比仅发送 `auth_token` + `ct0` 更接近普通浏览器流量，但不等于完整浏览器自动化。
 
@@ -507,11 +598,23 @@ twitter follow elonmusk --json
 TWITTER_CHROME_PROFILE="Profile 2" twitter feed
 ```
 
+**自定义 Chromium 目录**：适用于 Chromium、Opera 或自定义数据目录：
+
+```bash
+TWITTER_CHROMIUM_USER_DATA_DIR="/path/to/User Data" twitter feed
+```
+
 **浏览器优先级**：如果有多个浏览器，可通过 `TWITTER_BROWSER` 指定优先尝试的浏览器：
 
 ```bash
-TWITTER_BROWSER=chrome twitter feed    # 支持: arc, chrome, edge, firefox, brave
+TWITTER_BROWSER=chrome twitter feed    # 支持: arc, chrome, edge, firefox, brave, vivaldi, zen
 ```
+
+**高级 GraphQL 与签名环境变量**：
+- `TWITTER_QID_<OPERATION>=<queryId>` — 运行时覆盖指定 GraphQL operation 的 queryId（例如 `TWITTER_QID_HomeTimeline=...`）
+- `TWITTER_ALLOW_UNSIGNED=1` — 当写操作（`POST`）无法生成 `x-client-transaction-id` 时默认 fail-closed 拦截以防 226 风控，仅调试时可显式设此变量绕过
+
+**配置文件**：查找顺序为显式路径 → `./config.yaml` → `~/.twitter-cli/config.yaml` → 内置默认配置。可在 `display.time` 设置默认时间格式（`relative` / `absolute` / `iso`），显式 `--max` 可突破默认 `rateLimit.maxCount`（200）直到 10,000 安全上限。结构化输出规范见 [SCHEMA.md](./SCHEMA.md)。
 
 ### 代理支持
 
@@ -551,8 +654,8 @@ score = likes_w * likes
 
 ### 常见问题
 
-- 报错 `No Twitter cookies found`：请先登录 `x.com`，并确认浏览器为 Arc/Chrome/Edge/Firefox/Brave 之一，或手动设置环境变量。
-- 如需查看浏览器提取细节，可加 `-v` 打开诊断日志。
+- 报错 `No Twitter cookies found`：请先登录 `x.com`，并确认浏览器为 Arc/Chrome/Edge/Firefox/Brave/Vivaldi/Zen 之一（或通过 `TWITTER_CHROMIUM_USER_DATA_DIR` 指定目录），或手动设置 `TWITTER_COOKIE_STRING` / `TWITTER_AUTH_TOKEN` + `TWITTER_CT0`。
+- 如需查看浏览器提取细节或环境状态，可加 `-v` 或运行 `twitter doctor`。
 - 报错 `Cookie expired or invalid`：Cookie 过期，重新登录后重试。
 - 报错 `Unable to get key for cookie decryption`（macOS Keychain 问题）：
   - **SSH 远程登录**：Keychain 默认锁定，需手动解锁：
@@ -571,7 +674,7 @@ score = likes_w * likes
 
 
 
-- 结构化错误码通常会区分 `not_authenticated`、`not_found`、`invalid_input`、`rate_limited`、`api_error`。
+- 结构化错误码通常会区分 `not_authenticated`、`not_found`、`invalid_input`、`rate_limited`、`network_error`、`query_id_error`、`media_upload_error`、`api_error`。
 
 ### 使用建议（防封号）
 
@@ -596,7 +699,7 @@ twitter-cli 提供了 [`SKILL.md`](./SKILL.md)，可让 AI Agent 更稳定地调
 #### [Skills CLI](https://github.com/vercel-labs/skills)（推荐）
 
 ```bash
-npx skills add jackwener/twitter-cli
+npx skills add public-clis/twitter-cli
 ```
 
 | 参数 | 说明 |
@@ -609,7 +712,7 @@ npx skills add jackwener/twitter-cli
 
 ```bash
 mkdir -p .agents/skills
-git clone git@github.com:jackwener/twitter-cli.git .agents/skills/twitter-cli
+git clone git@github.com:public-clis/twitter-cli.git .agents/skills/twitter-cli
 ```
 
 #### ~~OpenClaw / ClawHub~~（已过时）

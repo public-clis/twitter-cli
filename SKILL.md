@@ -2,7 +2,7 @@
 name: twitter-cli
 description: Use twitter-cli for ALL Twitter/X operations — reading tweets, posting, replying, quoting, liking, retweeting, following, searching, user lookups. Invoke whenever user requests any Twitter interaction.
 author: jackwener
-version: "0.8.0"
+version: "0.8.6"
 tags:
   - twitter
   - x
@@ -19,7 +19,7 @@ tags:
 ## Setup
 
 ```bash
-# Install (requires Python 3.8+)
+# Install (requires Python 3.10+)
 uv tool install twitter-cli
 # Or: pipx install twitter-cli
 
@@ -32,7 +32,7 @@ uv tool upgrade twitter-cli
 
 **IMPORTANT FOR AGENTS**: Before executing ANY twitter-cli command, you MUST first check if credentials exist. If not, you MUST proactively guide the user through the authentication process. Do NOT assume credentials are configured.
 
-**CRITICAL**: Write operations (posting tweets, replying, quoting) REQUIRE full browser cookies. Only providing `auth_token` + `ct0` via env vars may result in **226 error** ("looks like automated behavior"). For best results, use browser cookie extraction.
+**CRITICAL**: Write operations (posting tweets, replying, quoting) REQUIRE full browser cookies. Only providing `auth_token` + `ct0` via env vars may result in **226 error** ("looks like automated behavior"). For best results, use browser cookie extraction or `TWITTER_COOKIE_STRING` (full `Cookie:` header).
 
 ### Step 0: Check if already authenticated
 
@@ -47,9 +47,10 @@ If `AUTH_NEEDED`, proceed to guide the user:
 
 **Method A: Browser cookie extraction (recommended)**
 
-Ensure user is logged into x.com in one of: Arc, Chrome, Edge, Firefox, Brave. twitter-cli auto-extracts cookies.
+Ensure user is logged into x.com in one of: Arc, Chrome, Edge, Firefox, Brave, Vivaldi, Zen. twitter-cli auto-extracts cookies.
 All Chrome profiles are scanned automatically. To specify a profile: `TWITTER_CHROME_PROFILE="Profile 2" twitter feed`.
-To prioritize a specific browser: `TWITTER_BROWSER=chrome twitter feed` (supported: arc, chrome, edge, firefox, brave).
+To point to a custom Chromium user data directory (e.g., Chromium, Opera, portable Chrome): `TWITTER_CHROMIUM_USER_DATA_DIR="/path/to/User Data" twitter feed`.
+To prioritize a specific browser: `TWITTER_BROWSER=chrome twitter feed` (supported: arc, chrome, edge, firefox, brave, vivaldi, zen).
 
 ```bash
 twitter whoami
@@ -63,9 +64,16 @@ export TWITTER_CT0="<ct0 from browser>"
 twitter whoami
 ```
 
-**Method C: Full cookie string (for cloud/remote agents)**
+**Method C: Full cookie string (recommended for cloud/remote agents & Windows Chrome >=127)**
 
-Tell the user:
+Pass the full browser `Cookie:` header via `TWITTER_COOKIE_STRING` (preserves all session/anti-bot cookies and auto-extracts `auth_token` + `ct0`):
+
+```bash
+export TWITTER_COOKIE_STRING="auth_token=...; ct0=...; twid=..."
+twitter whoami
+```
+
+If asking the user to copy it:
 
 > 我需要你的 Twitter 登录凭证。请按以下步骤获取：
 >
@@ -73,25 +81,14 @@ Tell the user:
 > 2. 按 `F12` 打开开发者工具 → **Network** 标签
 > 3. 在页面上刷新，点击任意 `x.com` 请求
 > 4. 找到 **Request Headers** → **Cookie:** 这一行，右键 → 复制值
-> 5. 把完整 Cookie 字符串发给我
->
-> ⚠️ Cookie 包含登录信息，请不要分享给其他人。
-
-Then extract and set env vars:
-
-```bash
-FULL_COOKIE="<user's cookie string>"
-export TWITTER_AUTH_TOKEN=$(echo "$FULL_COOKIE" | grep -oE 'auth_token=[a-f0-9]+' | cut -d= -f2)
-export TWITTER_CT0=$(echo "$FULL_COOKIE" | grep -oE 'ct0=[a-f0-9]+' | cut -d= -f2)
-twitter whoami
-```
+> 5. 把完整 Cookie 字符串设置为 `TWITTER_COOKIE_STRING` 环境变量（⚠️ Cookie 包含登录信息，请不要分享给其他人）。
 
 ### Step 2: Handle common auth issues
 
 | Symptom | Agent action |
 |---------|-------------|
 | `No Twitter cookies found` | Guide user to login to x.com in browser, or set env vars |
-| Read works, write returns 226 | Full cookies missing — use browser cookie extraction instead of env vars |
+| Read works, write returns 226 | Full cookies missing — use browser cookie extraction or `TWITTER_COOKIE_STRING` instead of minimal `auth_token`/`ct0` env vars |
 | `Cookie expired (401/403)` | Ask user to re-login to x.com and retry |
 | User changed password | All old cookies invalidated — re-extract |
 
@@ -109,7 +106,7 @@ Non-TTY stdout defaults to YAML automatically. Use `OUTPUT=yaml|json|rich|auto` 
 
 ```bash
 twitter feed --yaml
-twitter feed --json | jq '.[0].text'
+twitter feed --json | jq '.data[0].text'
 ```
 
 All machine-readable output uses the envelope documented in [SCHEMA.md](./SCHEMA.md).
@@ -144,31 +141,38 @@ twitter -c search "AI" --max 20       # ~80% fewer tokens than --json
 ```bash
 twitter status                         # Quick auth check
 twitter status --yaml                  # Structured auth status
+twitter doctor                         # Diagnostics (deps, config, auth presence, caches)
+twitter doctor --refresh               # Refresh cached GraphQL query IDs
 twitter whoami                         # Current authenticated user
 twitter whoami --yaml                  # YAML output
 twitter whoami --json                  # JSON output
-twitter user elonmusk                  # User profile
-twitter user elonmusk --json           # JSON output
+twitter user elonmusk                  # User profile (screen name or numeric rest_id)
+twitter user 44196397 --json           # Lookup by numeric user ID
 twitter feed                           # Home timeline (For You)
 twitter feed -t following              # Following timeline
 twitter feed --max 50                  # Limit count
 twitter feed --full-text               # Show full post body in table
+twitter --time iso feed                # Timestamp display: relative | absolute | iso
 twitter feed --filter                  # Enable ranking filter
 twitter feed --yaml > tweets.yaml      # Export as YAML
 twitter feed --input tweets.json       # Read from local JSON file
 twitter bookmarks                      # Bookmarked tweets
+twitter bookmarks --cursor "<cursor>"  # Paginate bookmarks
 twitter bookmarks --full-text          # Full text in bookmarks table
 twitter bookmarks --max 30 --yaml
+twitter news --max 20                  # Explore > News personalized stories
 twitter search "keyword"               # Search tweets
 twitter search "AI agent" -t Latest --max 50
 twitter search "AI agent" --full-text  # Full text in search results
 twitter search "topic" -o results.json # Save to file
 twitter tweet 1234567890               # Tweet detail + replies
+twitter tweet 1234567890 --cursor "<cursor>" # Paginate replies
 twitter tweet 1234567890 --full-text   # Full text in reply table
 twitter tweet https://x.com/user/status/12345  # Accepts URL
 twitter show 2                         # Open tweet #2 from last feed/search list
 twitter show 2 --full-text             # Full text in reply table
 twitter show 2 --json                  # Structured output
+twitter article 1234567890 --markdown  # Fetch Twitter Article as Markdown
 twitter list 1539453138322673664       # List timeline
 twitter list 1539453138322673664 --cursor "<next-cursor>"
 twitter list 1539453138322673664 --full-text
@@ -178,19 +182,24 @@ twitter likes elonmusk --max 30        # User's likes (own only, see note)
 twitter likes elonmusk --full-text
 twitter followers elonmusk --max 50    # Followers
 twitter following elonmusk --max 50    # Following
+twitter completion zsh                 # Print shell completion (bash/zsh/fish)
 ```
 
 ### Write Operations
 
 ```bash
-twitter post "Hello from twitter-cli!"              # Post tweet
+twitter post "Hello from twitter-cli!"              # Post tweet (auto-uses CreateNoteTweet for >280 chars on Premium)
 twitter post "Hello!" --image photo.jpg              # Post with image
 twitter post "Gallery" -i a.png -i b.jpg             # Up to 4 images
+twitter post "Demo clip" --video clip.mp4            # Post with video (mp4/mov/webm up to 512 MB)
 twitter reply 1234567890 "Great tweet!"              # Reply (standalone)
 twitter reply 1234567890 "Nice!" -i pic.png          # Reply with image
+twitter reply 1234567890 "Clip" -V clip.mp4          # Reply with video
 twitter post "reply text" --reply-to 1234567890      # Reply (via post)
 twitter quote 1234567890 "Interesting take"          # Quote-tweet
 twitter quote 1234567890 "Look" -i chart.png         # Quote with image
+twitter quote 1234567890 "Clip" -V clip.mp4          # Quote with video
+twitter article-publish post.md --title "My Post"    # Publish X Article from Markdown (--draft for draft)
 twitter delete 1234567890                            # Delete tweet
 twitter like 1234567890                              # Like
 twitter unlike 1234567890                            # Unlike
@@ -202,11 +211,9 @@ twitter follow elonmusk                              # Follow user
 twitter unfollow elonmusk                            # Unfollow user
 ```
 
-**Image upload notes:**
-- Supported formats: JPEG, PNG, GIF, WebP
-- Max file size: 5 MB per image
-- Max 4 images per tweet
-- Use `--image` / `-i` (repeatable)
+**Media upload notes:**
+- Images: JPEG, PNG, GIF, WebP — max 5 MB per image, up to 4 images per tweet (`--image` / `-i`)
+- Video: MP4, MOV, WebM — max 512 MB, 1 video per tweet (`--video` / `-V`, chunked upload + async processing poll); cannot mix images and video in the same tweet
 
 ## Agent Workflows
 
@@ -262,7 +269,7 @@ done
 ### Get user info then follow
 
 ```bash
-twitter user targethandle --json | jq '.data | {username, followers, bio}'
+twitter user targethandle --json | jq '.data | {screenName, followers, bio}'
 twitter follow targethandle
 ```
 
@@ -275,8 +282,8 @@ twitter user-posts elonmusk --max 20 --json | jq '.data | sort_by(.metrics.likes
 ### Check follower relationship
 
 ```bash
-MY_NAME=$(twitter whoami --json | jq -r '.data.user.username')
-twitter followers "$MY_NAME" --max 200 --json | jq -r '.data[].username' | grep -q "targetuser" && echo "Yes" || echo "No"
+MY_NAME=$(twitter whoami --json | jq -r '.data.user.screenName')
+twitter followers "$MY_NAME" --max 200 --json | jq -r '.data[].screenName' | grep -q "targetuser" && echo "Yes" || echo "No"
 ```
 
 ### Daily reading workflow
@@ -322,25 +329,26 @@ twitter bookmarks --filter
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `No Twitter cookies found` | Not authenticated | Login to x.com in browser, or set env vars |
-| HTTP 226 | Automated detection | Use browser cookie extraction (not env vars) |
+| HTTP 226 | Automated detection | Use browser cookie extraction or full `TWITTER_COOKIE_STRING` |
 | HTTP 401/403 | Cookie expired | Re-login to x.com and retry |
-| HTTP 404 | QueryId rotation | Retry (auto-fallback built in) |
+| HTTP 404 | QueryId rotation | Retry (auto-fallback built in) or run `twitter doctor --refresh` |
 | HTTP 429 | Rate limited | Wait 15+ minutes, then retry |
 | Error 187 | Duplicate tweet | Change text content |
-| Error 186 | Tweet too long | Keep under 280 chars |
+| Error 186 | Tweet too long | Keep under 280 weighted chars (or use X Premium, which auto-routes via `CreateNoteTweet`) |
 
 ## Limitations
 
-- **Images only** — video/GIF animation upload not yet supported (image upload supports JPEG/PNG/GIF/WebP)
 - **No DMs** — no direct messaging
 - **No notifications** — can't read notifications
 - **No polls** — can't create polls
 - **Single account** — one set of credentials at a time
 - **Likes are private** — Twitter/X made all likes private since June 2024. `twitter likes` only works for your own account
+- **Long-form posts & Articles** — posts > 280 weighted chars automatically use `CreateNoteTweet` and `article-publish` publishes X Articles (both require an X Premium account)
 
 ## Safety Notes
 
 - Write operations have built-in random delays (1.5–4s) to avoid rate limits.
+- GraphQL write (`POST`) requests fail closed if `x-client-transaction-id` cannot be generated, preventing unsigned-write 226 flags (override only for debugging with `TWITTER_ALLOW_UNSIGNED=1`).
 - TLS fingerprint and User-Agent are automatically matched to the Chrome version used.
 - Do not ask users to share raw cookie values in chat logs.
 - Prefer local browser cookie extraction over manual secret copy/paste.

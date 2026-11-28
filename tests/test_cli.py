@@ -868,3 +868,223 @@ def test_show_malformed_cache_treated_as_empty(monkeypatch, tmp_path):
     result = runner.invoke(cli, ["show", "1"])
     assert result.exit_code != 0
     assert "No cached results" in result.output
+
+
+def test_cli_tweet_reports_missing_focal_tweet_as_structured_error(monkeypatch) -> None:
+    from twitter_cli.exceptions import NotFoundError
+
+    class FakeClient:
+        def fetch_tweet_detail(self, tweet_id: str, max_count: int, cursor=None, return_cursor=False):
+            raise NotFoundError("Tweet %s was not returned by the TweetDetail response" % tweet_id)
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 50}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["tweet", "12345", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "not_found"
+    assert "TweetDetail response" in payload["error"]["message"]
+
+
+def test_cli_tweet_emits_pagination_cursor_and_thread_fields(monkeypatch, tweet_factory) -> None:
+    captured = {}
+
+    class FakeClient:
+        def fetch_tweet_detail(self, tweet_id: str, max_count: int, cursor=None, return_cursor=False):
+            captured["cursor"] = cursor
+            captured["return_cursor"] = return_cursor
+            return [
+                tweet_factory("100", conversation_id="100"),
+                tweet_factory("101", conversation_id="100", in_reply_to_status_id="100", in_reply_to_screen_name="alice"),
+            ], "cursor-replies-2"
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 50}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["tweet", "100", "--cursor", "cursor-1", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["pagination"]["nextCursor"] == "cursor-replies-2"
+    assert payload["data"][1]["conversationId"] == "100"
+    assert payload["data"][1]["inReplyToStatusId"] == "100"
+    assert captured == {"cursor": "cursor-1", "return_cursor": True}
+
+
+def test_cli_bookmarks_cursor_pagination(monkeypatch, tweet_factory) -> None:
+    captured = {}
+
+    class FakeClient:
+        def fetch_bookmarks(self, count: int, cursor=None, return_cursor=False):
+            captured["cursor"] = cursor
+            captured["return_cursor"] = return_cursor
+            return [tweet_factory("77")], "bm-cursor-2"
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 20}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["bookmarks", "--cursor", "bm-cursor-1", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"][0]["id"] == "77"
+    assert payload["pagination"]["nextCursor"] == "bm-cursor-2"
+    assert captured == {"cursor": "bm-cursor-1", "return_cursor": True}
+
+
+def test_cli_news_json(monkeypatch) -> None:
+    captured = {}
+
+    class FakeClient:
+        def fetch_explore_news(self, count: int):
+            captured["count"] = count
+            return [
+                {
+                    "rank": 1,
+                    "title": "Major AI story",
+                    "context": "Trending now · News · 105 posts",
+                    "post_count": 105,
+                    "url": "https://x.com/i/trending/123",
+                }
+            ]
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    monkeypatch.setattr(
+        "twitter_cli.cli.load_config",
+        lambda: {"fetch": {"count": 50}, "filter": {}, "rateLimit": {}},
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["news", "--max", "5", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"][0]["title"] == "Major AI story"
+    assert captured == {"count": 5}
+
+
+def test_cli_doctor_json_never_leaks_secrets(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("TWITTER_AUTH_TOKEN", "super-secret-auth-token")
+    monkeypatch.setenv("TWITTER_CT0", "super-secret-ct0")
+    monkeypatch.setattr("twitter_cli.cli._qid_cache_path", lambda: tmp_path / "missing.json")
+    monkeypatch.setattr(
+        "twitter_cli.cli.TwitterClient._ct_cache_path",
+        staticmethod(lambda: str(tmp_path / "missing_ct.json")),
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["doctor", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert "super-secret-auth-token" not in result.output
+    assert "super-secret-ct0" not in result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    categories = {c["category"] for c in payload["data"]["checks"]}
+    assert {"deps", "config", "auth", "tx_cache", "query_ids"}.issubset(categories)
+
+
+def test_cli_like_accepts_full_tweet_url(monkeypatch) -> None:
+    called = []
+
+    class FakeClient:
+        def like_tweet(self, tweet_id: str):
+            called.append(tweet_id)
+            return True
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["like", "https://x.com/alice/status/987654321", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert called == ["987654321"]
+
+
+def test_cli_post_with_video_and_mutually_exclusive_image(monkeypatch, tmp_path) -> None:
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"\x00" * 64)
+    img = tmp_path / "pic.png"
+    img.write_bytes(b"\x89PNG")
+    uploaded = []
+
+    class FakeClient:
+        def upload_media(self, path: str) -> str:
+            uploaded.append(path)
+            return "media-vid-1"
+
+        def create_tweet(self, text: str, reply_to_id=None, media_ids=None) -> str:
+            assert media_ids == ["media-vid-1"]
+            return "tweet-555"
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    runner = CliRunner()
+
+    ok_res = runner.invoke(cli, ["post", "Watch this", "--video", str(vid), "--json"])
+    assert ok_res.exit_code == 0, ok_res.output
+    assert json.loads(ok_res.output)["data"]["id"] == "tweet-555"
+    assert uploaded == [str(vid)]
+
+    bad_res = runner.invoke(cli, ["post", "Both", "-i", str(img), "-V", str(vid)])
+    assert bad_res.exit_code != 0
+    assert "not both" in bad_res.output
+
+
+def test_cli_article_publish_json_and_draft_yaml(monkeypatch, tmp_path) -> None:
+    markdown_path = tmp_path / "article.md"
+    markdown_path.write_text("# Heading\n\nBody with [link](https://example.com).", encoding="utf-8")
+    captured = {}
+
+    class FakeClient:
+        def create_article(self, title, content_state, publish=True):
+            captured["title"] = title
+            captured["content_state"] = content_state
+            captured["publish"] = publish
+            return {
+                "id": "article-1" if publish else "draft-1",
+                "title": title,
+                "url": (
+                    "https://x.com/i/article/article-1"
+                    if publish
+                    else "https://x.com/compose/article/edit/draft-1"
+                ),
+                "published": publish,
+            }
+
+    monkeypatch.setattr("twitter_cli.cli._get_client", lambda config=None, quiet=False: FakeClient())
+    runner = CliRunner()
+
+    pub_res = runner.invoke(
+        cli, ["article-publish", str(markdown_path), "--title", "Article title", "--json"]
+    )
+    assert pub_res.exit_code == 0, pub_res.output
+    payload = json.loads(pub_res.output)
+    assert payload["data"]["id"] == "article-1"
+    assert payload["data"]["published"] is True
+    assert captured["content_state"]["blocks"][0]["type"] == "header-one"
+
+    draft_res = runner.invoke(
+        cli, ["article-publish", str(markdown_path), "--title", "Draft title", "--draft", "--yaml"]
+    )
+    assert draft_res.exit_code == 0, draft_res.output
+    yaml_payload = yaml.safe_load(draft_res.output)
+    assert yaml_payload["data"]["id"] == "draft-1"
+    assert yaml_payload["data"]["published"] is False

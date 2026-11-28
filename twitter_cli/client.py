@@ -9,14 +9,18 @@ import math
 import mimetypes
 import os
 import random
+import re
 import time
 import urllib.parse
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, cast
 
 import bs4
 from curl_cffi import requests as _cffi_requests
 from x_client_transaction import ClientTransaction
 from x_client_transaction.utils import generate_headers as _gen_ct_headers, get_ondemand_file_url
+
+from .cache import _open_owner_only, _tighten_dir
 
 from .constants import (
     BEARER_TOKEN,
@@ -40,12 +44,13 @@ from .exceptions import (
     TwitterAPIError,
 )
 from .graphql import (
-    FALLBACK_QUERY_IDS,
+    ARTICLE_FEATURES,
     FEATURES,
     _build_graphql_url,
     _invalidate_query_id,
     _resolve_query_id,
     _update_features_from_html,
+    operation_features,
 )
 from .models import BookmarkFolder, UserProfile
 from .parser import (
@@ -55,6 +60,7 @@ from .parser import (
     parse_tweet_result,
     parse_user_result,
 )
+from .text import CREATE_NOTE_TWEET_OPERATION, tweet_create_route
 
 if TYPE_CHECKING:
     from typing import Dict, List, Optional, Set, Tuple  # noqa: F401
@@ -68,8 +74,9 @@ _cffi_session = None
 
 TimelineInstructionGetter = Callable[[Any], Any]
 
-# Hard ceiling to prevent accidental massive fetches
-_ABSOLUTE_MAX_COUNT = 500
+# Hard safety ceiling to prevent runaway fetches; explicit --max on user lists
+# is honoured up to here (issue #50).
+_ABSOLUTE_MAX_COUNT = 10000
 
 
 # ── Session management ───────────────────────────────────────────────────
@@ -90,8 +97,8 @@ def _best_chrome_target():
         logger.debug("curl_cffi.BrowserType not available, using fallback targets")
         available = set()
 
-    # Preference order: exact chrome versions, then suffixed variants
-    for target in ("chrome133", "chrome133a", "chrome136", "chrome131", "chrome130"):
+    # Preference order: modern Chrome versions first, then older fallbacks
+    for target in ("chrome136", "chrome133a", "chrome133", "chrome131", "chrome130"):
         if target in available:
             return target
     # Fallback: pick highest chrome* with a pure numeric suffix
@@ -128,6 +135,202 @@ def _url_fetch(url, headers=None):
     resp = session.get(url, headers=headers or {}, timeout=30)
     resp.raise_for_status()
     return resp.text
+
+
+def _is_stale_query_error(exc):
+    # type: (TwitterAPIError) -> bool
+    """Return whether an API error indicates a stale persisted query ID."""
+    if exc.status_code in (404, 422):
+        return True
+    if exc.status_code not in (0, 400):
+        return False
+    message = exc.message.lower()
+    return any(
+        marker in message
+        for marker in (
+            "query: unspecified",
+            "persistedquerynotfound",
+            "persisted query not found",
+            "query not found",
+        )
+    )
+
+
+def _coerce_string(value):
+    # type: (Any) -> str
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _first_text(*values):
+    # type: (*Any) -> str
+    for value in values:
+        text = _coerce_string(value)
+        if text:
+            return text
+    return ""
+
+
+def _extract_post_count(text):
+    # type: (str) -> Optional[int]
+    match = re.search(r"([\d,.]+)\s*([KMB])?\s+(?:posts?|tweets?)", text or "", re.IGNORECASE)
+    if not match:
+        return None
+    raw = match.group(1).replace(",", "").strip()
+    try:
+        numeric = float(raw)
+    except ValueError:
+        return None
+    suffix = (match.group(2) or "").upper()
+    if suffix == "K":
+        numeric *= 1_000
+    elif suffix == "M":
+        numeric *= 1_000_000
+    elif suffix == "B":
+        numeric *= 1_000_000_000
+    return int(round(numeric))
+
+
+def _twitter_deeplink_to_url(url):
+    # type: (Optional[str]) -> Optional[str]
+    if not url:
+        return None
+    if url.startswith(("https://", "http://")):
+        return url
+    if url.startswith("twitter://trending/"):
+        parsed = urllib.parse.urlparse(url)
+        trend_id = _extract_trend_id(url) or parsed.path.rsplit("/", 1)[-1]
+        return "https://x.com/i/trending/%s" % urllib.parse.quote(trend_id)
+    if url.startswith(("twitter://search/", "twitter://search?")):
+        parsed = urllib.parse.urlparse(url)
+        query = urllib.parse.parse_qs(parsed.query)
+        raw_query = query.get("query", [""])[0]
+        if raw_query:
+            return "https://x.com/search?q=%s" % urllib.parse.quote(raw_query)
+        return "https://x.com/explore"
+    return url
+
+
+def _extract_query_from_url(url):
+    # type: (Optional[str]) -> str
+    if not url:
+        return ""
+    parsed = urllib.parse.urlparse(url)
+    params = urllib.parse.parse_qs(parsed.query)
+    return _first_text(params.get("query", [""])[0], params.get("q", [""])[0])
+
+
+def _extract_trend_id(url):
+    # type: (Optional[str]) -> Optional[str]
+    if not url:
+        return None
+    match = re.search(r"(?:twitter://trending/|/i/trending/)(\d+)", url)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _normalize_explore_story(raw, rank):
+    # type: (Any, int) -> Optional[Dict[str, Any]]
+    if not isinstance(raw, dict):
+        return None
+
+    typename = raw.get("__typename") or raw.get("itemType") or ""
+    metadata = raw.get("trend_metadata") or {}
+    social_context = raw.get("social_context") or {}
+    url_obj = metadata.get("url") or raw.get("trend_url") or raw.get("url") or {}
+    raw_url = url_obj.get("url") if isinstance(url_obj, dict) else _coerce_string(url_obj)
+
+    title = _first_text(
+        raw.get("name"),
+        raw.get("title"),
+        raw.get("headline"),
+        raw.get("display_text"),
+        raw.get("text"),
+        _deep_get(raw, "content", "title"),
+    )
+    if not title:
+        return None
+
+    context = _first_text(
+        social_context.get("text"),
+        metadata.get("domain_context"),
+        raw.get("context"),
+        raw.get("description"),
+    )
+    category = _first_text(metadata.get("domain_context"))
+
+    return {
+        "rank": rank,
+        "title": title,
+        "name": title,
+        "category": category,
+        "context": context,
+        "query": _extract_query_from_url(raw_url) or title,
+        "url": _twitter_deeplink_to_url(raw_url),
+        "post_count": _extract_post_count(context),
+        "trend_id": _extract_trend_id(raw_url),
+        "is_ai_trend": bool(raw.get("is_ai_trend")),
+        "type": typename,
+    }
+
+
+def _extract_explore_item_contents(instructions):
+    # type: (Any) -> List[Dict[str, Any]]
+    items = []  # type: List[Dict[str, Any]]
+    for instruction in instructions or []:
+        for entry in instruction.get("entries", []) or []:
+            content = entry.get("content", {}) or {}
+            item_content = content.get("itemContent")
+            if isinstance(item_content, dict):
+                items.append(item_content)
+            for module_item in content.get("items", []) or []:
+                module_content = _deep_get(module_item, "item", "itemContent")
+                if isinstance(module_content, dict):
+                    items.append(module_content)
+    return items
+
+
+def _normalize_explore_items(instructions, count=20):
+    # type: (Any, int) -> List[Dict[str, Any]]
+    stories = []  # type: List[Dict[str, Any]]
+    seen = set()
+    for raw in _extract_explore_item_contents(instructions):
+        story = _normalize_explore_story(raw, rank=len(stories) + 1)
+        if not story:
+            continue
+        key = (story.get("title"), story.get("url"))
+        if key in seen:
+            continue
+        seen.add(key)
+        stories.append(story)
+        if len(stories) >= count:
+            break
+    return stories
+
+
+def _prepare_tweet_create(text, variables):
+    # type: (str, Dict[str, Any]) -> Tuple[str, Dict[str, Any]]
+    """Apply operation-specific variables and return its feature set."""
+    operation_name, weighted_length = tweet_create_route(text)
+    if operation_name == CREATE_NOTE_TWEET_OPERATION:
+        variables["disallowed_reply_options"] = None
+        logger.info(
+            "Tweet weighted=%d, using CreateNoteTweet (long-form)",
+            weighted_length,
+        )
+    return operation_name, operation_features(operation_name)
+
+
+def _created_tweet_result(data):
+    # type: (Dict[str, Any]) -> Optional[Dict[str, Any]]
+    """Extract tweet result from CreateTweet or CreateNoteTweet responses."""
+    return (
+        _deep_get(data, "data", "create_tweet", "tweet_results", "result")
+        or _deep_get(data, "data", "notetweet_create", "tweet_results", "result")
+        or _deep_get(data, "data", "create_note_tweet", "tweet_results", "result")
+    )
 
 
 # ── TwitterClient ────────────────────────────────────────────────────────
@@ -177,9 +380,13 @@ class TwitterClient:
             return_cursor=return_cursor,
         )
 
-    def fetch_bookmarks(self, count=50):
-        # type: (int) -> List[Tweet]
-        """Fetch bookmarked tweets."""
+    def fetch_bookmarks(self, count=50, cursor=None, return_cursor=False):
+        # type: (int, Optional[str], bool) -> Any
+        """Fetch bookmarked tweets.
+
+        When ``return_cursor`` is True, returns ``(tweets, next_cursor)`` for
+        resumable batched pagination.
+        """
         def get_instructions(data):
             # type: (Any) -> Any
             instructions = _deep_get(data, "data", "bookmark_timeline", "timeline", "instructions")
@@ -187,7 +394,13 @@ class TwitterClient:
                 instructions = _deep_get(data, "data", "bookmark_timeline_v2", "timeline", "instructions")
             return instructions
 
-        return self._fetch_timeline("Bookmarks", count, get_instructions)
+        return self._fetch_timeline(
+            "Bookmarks",
+            count,
+            get_instructions,
+            start_cursor=cursor,
+            return_cursor=return_cursor,
+        )
 
     def fetch_bookmark_folders(self):
         # type: () -> List[BookmarkFolder]
@@ -253,51 +466,75 @@ class TwitterClient:
         profile = self.fetch_user(identifier)
         return profile.id
 
+    _USER_FEATURES = {
+        "hidden_profile_subscriptions_enabled": True,
+        "rweb_tipjar_consumption_enabled": True,
+        "responsive_web_graphql_exclude_directive_enabled": True,
+        "verified_phone_label_enabled": False,
+        "subscriptions_verification_info_is_identity_verified_enabled": True,
+        "subscriptions_verification_info_verified_since_enabled": True,
+        "highlights_tweets_tab_ui_enabled": True,
+        "responsive_web_twitter_article_notes_tab_enabled": True,
+        "subscriptions_feature_can_gift_premium": True,
+        "creator_subscriptions_tweet_preview_api_enabled": True,
+        "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+        "responsive_web_graphql_timeline_navigation_enabled": True,
+    }
+
+    def fetch_user_by_id(self, user_id):
+        # type: (str) -> UserProfile
+        """Fetch user profile by numeric user ID (UserByRestId)."""
+        variables = {
+            "userId": user_id,
+            "withSafetyModeUserFields": True,
+        }
+        data = self._graphql_get("UserByRestId", variables, self._USER_FEATURES)
+        result = _deep_get(data, "data", "user", "result")
+        profile = parse_user_result(result) if isinstance(result, dict) else None
+        if not profile:
+            raise NotFoundError("User %s not found" % user_id)
+        return profile
+
     def fetch_user(self, screen_name):
         # type: (str) -> UserProfile
-        """Fetch user profile by screen name."""
+        """Fetch user profile by screen name or numeric user ID."""
+        if screen_name.isdigit():
+            return self.fetch_user_by_id(screen_name)
         variables = {
             "screen_name": screen_name,
             "withSafetyModeUserFields": True,
         }
-        features = {
-            "hidden_profile_subscriptions_enabled": True,
-            "rweb_tipjar_consumption_enabled": True,
-            "responsive_web_graphql_exclude_directive_enabled": True,
-            "verified_phone_label_enabled": False,
-            "subscriptions_verification_info_is_identity_verified_enabled": True,
-            "subscriptions_verification_info_verified_since_enabled": True,
-            "highlights_tweets_tab_ui_enabled": True,
-            "responsive_web_twitter_article_notes_tab_enabled": True,
-            "subscriptions_feature_can_gift_premium": True,
-            "creator_subscriptions_tweet_preview_api_enabled": True,
-            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-            "responsive_web_graphql_timeline_navigation_enabled": True,
-        }
-        data = self._graphql_get("UserByScreenName", variables, features)
+        data = self._graphql_get("UserByScreenName", variables, self._USER_FEATURES)
         result = _deep_get(data, "data", "user", "result")
-        if not result:
+        if not isinstance(result, dict):
             raise NotFoundError("User @%s not found" % screen_name)
 
-        legacy = result.get("legacy", {})
-        core = result.get("core", {})
-        avatar = result.get("avatar", {})
-        location_obj = result.get("location", {})
-        return UserProfile(
-            id=result.get("rest_id", ""),
-            name=core.get("name") or legacy.get("name", ""),
-            screen_name=core.get("screen_name") or legacy.get("screen_name", screen_name),
-            bio=legacy.get("description", ""),
-            location=location_obj.get("location") or legacy.get("location", ""),
-            url=_deep_get(legacy, "entities", "url", "urls", 0, "expanded_url") or "",
-            followers_count=_parse_int(legacy.get("followers_count"), 0),
-            following_count=_parse_int(legacy.get("friends_count"), 0),
-            tweets_count=_parse_int(legacy.get("statuses_count"), 0),
-            likes_count=_parse_int(legacy.get("favourites_count"), 0),
-            verified=bool(result.get("is_blue_verified") or legacy.get("verified", False)),
-            profile_image_url=avatar.get("image_url") or legacy.get("profile_image_url_https", ""),
-            created_at=core.get("created_at") or legacy.get("created_at", ""),
-        )
+        profile = parse_user_result(result)
+        if profile is None:
+            if result.get("__typename") == "UserUnavailable" or not result:
+                raise NotFoundError("User @%s not found" % screen_name)
+            legacy = result.get("legacy") or {}
+            core = result.get("core") or {}
+            avatar = result.get("avatar") or {}
+            location_obj = result.get("location") or {}
+            return UserProfile(
+                id=result.get("rest_id", ""),
+                name=core.get("name") or legacy.get("name", ""),
+                screen_name=core.get("screen_name") or legacy.get("screen_name", screen_name),
+                bio=legacy.get("description", ""),
+                location=location_obj.get("location") or legacy.get("location", ""),
+                url=_deep_get(legacy, "entities", "url", "urls", 0, "expanded_url") or "",
+                followers_count=_parse_int(legacy.get("followers_count"), 0),
+                following_count=_parse_int(legacy.get("friends_count"), 0),
+                tweets_count=_parse_int(legacy.get("statuses_count"), 0),
+                likes_count=_parse_int(legacy.get("favourites_count"), 0),
+                verified=bool(result.get("is_blue_verified") or legacy.get("verified", False)),
+                profile_image_url=avatar.get("image_url") or legacy.get("profile_image_url_https", ""),
+                created_at=core.get("created_at") or legacy.get("created_at", ""),
+            )
+        if not profile.screen_name:
+            profile.screen_name = screen_name
+        return profile
 
     def fetch_user_tweets(self, user_id, count=20):
         # type: (str, int) -> List[Tweet]
@@ -370,10 +607,51 @@ class TwitterClient:
             use_post=True,
         )
 
-    def fetch_tweet_detail(self, tweet_id, count=20):
-        # type: (str, int) -> List[Tweet]
-        """Fetch a tweet and its conversation thread (replies)."""
-        return self._fetch_timeline(
+    def fetch_explore_news(self, count=20):
+        # type: (int) -> List[Dict[str, Any]]
+        """Fetch personalized Explore > News story cards."""
+        if count <= 0:
+            return []
+        count = min(count, self._max_count)
+
+        page = self._graphql_get(
+            "ExplorePage",
+            {"cursor": "", "context": "news"},
+            FEATURES,
+        )
+        timelines = _deep_get(page, "data", "explore_page", "body", "timelines") or []
+        news_timeline_id = None
+        for timeline in timelines:
+            if timeline.get("id") == "news":
+                news_timeline_id = _deep_get(timeline, "timeline", "id")
+                break
+        if not news_timeline_id:
+            raise TwitterAPIError(0, "Explore News timeline was not found")
+
+        data = self._graphql_get(
+            "GenericTimelineById",
+            {
+                "timelineId": news_timeline_id,
+                "count": min(count + 5, 40),
+                "withQuickPromoteEligibilityTweetFields": True,
+            },
+            FEATURES,
+        )
+        instructions = _deep_get(data, "data", "timeline", "timeline", "instructions")
+        return _normalize_explore_items(instructions, count=count)
+
+    def fetch_tweet_detail(self, tweet_id, count=20, cursor=None, return_cursor=False):
+        # type: (str, int, Optional[str], bool) -> Any
+        """Fetch a tweet and its conversation thread (replies).
+
+        When ``cursor`` is None, verifies that the focal tweet is present in
+        the response (raising NotFoundError instead of silently returning empty
+        or reply-only results) and places it first before truncating to ``count``.
+        """
+        if count <= 0:
+            return ([], None) if return_cursor else []
+
+        result = self._fetch_timeline(
             "TweetDetail",
             count,
             lambda data: _deep_get(data, "data", "tweetResult", "result", "timeline", "instructions")
@@ -396,7 +674,27 @@ class TwitterClient:
                 "withGrokAnalyze": False,
                 "withDisallowedReplyControls": False,
             },
+            start_cursor=cursor,
+            return_cursor=return_cursor,
+            truncate=cursor is not None,
         )
+        if return_cursor:
+            tweets, next_cursor = result
+        else:
+            tweets, next_cursor = result, None
+
+        if cursor is None:
+            focal_tweet = next((tweet for tweet in tweets if tweet.id == tweet_id), None)
+            if focal_tweet is None:
+                raise NotFoundError(
+                    "Tweet %s was not returned by the TweetDetail response" % tweet_id
+                )
+            limit = min(count, getattr(self, "_max_count", count))
+            tweets = ([focal_tweet] + [tweet for tweet in tweets if tweet.id != tweet_id])[:limit]
+
+        if return_cursor:
+            return tweets, next_cursor
+        return tweets
 
     def fetch_article(self, tweet_id):
         # type: (str) -> Tweet
@@ -437,6 +735,84 @@ class TwitterClient:
         logger.info("fetch_article: tweet_id=%s", tweet_id)
         return tweet
 
+    def create_article(self, title, content_state, publish=True):
+        # type: (str, Dict[str, Any], bool) -> Dict[str, Any]
+        """Create an X Article draft, optionally publish it, and return metadata."""
+        if not title.strip():
+            raise TwitterAPIError(0, "Article title is required")
+
+        article_id = self._create_article_draft()
+        self._update_article_title(article_id, title)
+        self._update_article_content(article_id, content_state)
+        if publish:
+            article_id = self._publish_article(article_id)
+            url = "https://x.com/i/article/%s" % article_id
+        else:
+            url = "https://x.com/compose/article/edit/%s" % article_id
+
+        self._write_delay()
+        return {
+            "id": article_id,
+            "title": title,
+            "url": url,
+            "published": bool(publish),
+        }
+
+    def _create_article_draft(self):
+        # type: () -> str
+        variables = {
+            "content_state": {"blocks": [], "entity_map": []},
+            "title": "",
+        }
+        data = self._graphql_post("ArticleEntityDraftCreate", variables, ARTICLE_FEATURES)
+        result = _deep_get(
+            data,
+            "data",
+            "articleentity_create_draft",
+            "article_entity_results",
+            "result",
+        )
+        if result and result.get("rest_id"):
+            return result["rest_id"]
+        raise TwitterAPIError(0, "Failed to create article draft")
+
+    def _update_article_title(self, article_id, title):
+        # type: (str, str) -> None
+        variables = {
+            "articleEntityId": article_id,
+            "title": title,
+        }
+        self._graphql_post("ArticleEntityUpdateTitle", variables, ARTICLE_FEATURES)
+
+    def _update_article_content(self, article_id, content_state):
+        # type: (str, Dict[str, Any]) -> None
+        variables = {
+            "content_state": {
+                "blocks": content_state.get("blocks") or [],
+                "entity_map": content_state.get("entity_map") or [],
+            },
+            "article_entity": article_id,
+        }
+        self._graphql_post("ArticleEntityUpdateContent", variables, ARTICLE_FEATURES)
+
+    def _publish_article(self, article_id):
+        # type: (str) -> str
+        variables = {
+            "articleEntityId": article_id,
+            "visibilitySetting": "Public",
+        }
+        data = self._graphql_post("ArticleEntityPublish", variables, ARTICLE_FEATURES)
+        result = _deep_get(
+            data,
+            "data",
+            "articleentity_publish",
+            "article_entity_results",
+            "result",
+        )
+        if result and result.get("rest_id"):
+            return result["rest_id"]
+        raise TwitterAPIError(0, "Failed to publish article")
+
     def fetch_list_timeline(self, list_id, count=20, cursor=None, return_cursor=False):
         # type: (str, int, Optional[str], bool) -> Any
         """Fetch tweets from a Twitter List."""
@@ -470,9 +846,14 @@ class TwitterClient:
 
     # ── Write operations ─────────────────────────────────────────────
 
-    # Supported image MIME types and max file size (5 MB)
+    # Supported image/video MIME types and max file sizes
     _SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+    _SUPPORTED_VIDEO_TYPES = {"video/mp4", "video/quicktime", "video/webm"}
     _MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5 MB
+    _MAX_VIDEO_SIZE = 512 * 1024 * 1024  # 512 MB (X hard cap for tweet_video)
+    # Keep raw chunk <= 2 MB so base64 + form encoding stays safely below X's 5 MB segment limit
+    _VIDEO_CHUNK_SIZE = 2 * 1024 * 1024
+    _VIDEO_PROCESS_TIMEOUT = 300  # seconds to wait for async video processing
 
     def _write_delay(self):
         # type: () -> None
@@ -483,26 +864,44 @@ class TwitterClient:
 
     def upload_media(self, file_path):
         # type: (str) -> str
-        """Upload an image file to Twitter.  Returns the media_id string.
+        """Upload an image or video file to Twitter.  Returns the media_id string.
 
-        Uses Twitter's chunked upload API (INIT → APPEND → FINALIZE).
-        Supports JPEG, PNG, GIF, and WebP images up to 5 MB.
+        Uses Twitter's chunked upload API (INIT → APPEND → FINALIZE [+ STATUS]).
+        Images: JPEG, PNG, GIF, WebP up to 5 MB.
+        Videos (mp4/mov/webm): up to 512 MB, uploaded in 2 MB chunks with async STATUS polling.
         """
         if not os.path.isfile(file_path):
             raise MediaUploadError("File not found: %s" % file_path)
 
         file_size = os.path.getsize(file_path)
-        if file_size > self._MAX_IMAGE_SIZE:
-            raise MediaUploadError(
-                "File too large: %.1f MB (max %.0f MB)"
-                % (file_size / (1024 * 1024), self._MAX_IMAGE_SIZE / (1024 * 1024))
-            )
+        if file_size <= 0:
+            raise MediaUploadError("File is empty: %s" % file_path)
 
         media_type = mimetypes.guess_type(file_path)[0] or ""
-        if media_type not in self._SUPPORTED_IMAGE_TYPES:
-            raise MediaUploadError(
-                "Unsupported image format: %s (supported: jpeg, png, gif, webp)" % media_type
-            )
+        is_video = media_type in self._SUPPORTED_VIDEO_TYPES
+
+        if media_type.startswith("video/"):
+            if not is_video:
+                raise MediaUploadError(
+                    "Unsupported video format: %s (supported: mp4, mov, webm)" % media_type
+                )
+            if file_size > self._MAX_VIDEO_SIZE:
+                raise MediaUploadError(
+                    "File too large: %.1f MB (max %.0f MB)"
+                    % (file_size / (1024 * 1024), self._MAX_VIDEO_SIZE / (1024 * 1024))
+                )
+            media_category = "tweet_video"
+        else:
+            if file_size > self._MAX_IMAGE_SIZE:
+                raise MediaUploadError(
+                    "File too large: %.1f MB (max %.0f MB)"
+                    % (file_size / (1024 * 1024), self._MAX_IMAGE_SIZE / (1024 * 1024))
+                )
+            if media_type not in self._SUPPORTED_IMAGE_TYPES:
+                raise MediaUploadError(
+                    "Unsupported image format: %s (supported: jpeg, png, gif, webp)" % media_type
+                )
+            media_category = "tweet_gif" if media_type == "image/gif" else "tweet_image"
 
         upload_url = "https://upload.twitter.com/i/media/upload.json"
         session = _get_cffi_session()
@@ -514,6 +913,7 @@ class TwitterClient:
             "command": "INIT",
             "total_bytes": str(file_size),
             "media_type": media_type,
+            "media_category": media_category,
         }
         resp = session.post(upload_url, headers=headers, data=init_data, timeout=30)
         if resp.status_code >= 400:
@@ -525,25 +925,36 @@ class TwitterClient:
         media_id = init_result.get("media_id_string", "")
         if not media_id:
             raise MediaUploadError("INIT did not return media_id")
-        logger.info("Media INIT: media_id=%s", media_id)
+        logger.info("Media INIT: media_id=%s category=%s", media_id, media_category)
 
         # ── APPEND ───────────────────────────────────────────────────
+        segment_index = 0
         with open(file_path, "rb") as f:
-            media_data = base64.b64encode(f.read()).decode("ascii")
-
-        headers = self._build_headers(url=upload_url, method="POST")
-        # Remove JSON content-type — curl_cffi handles multipart encoding
-        headers.pop("Content-Type", None)
-        append_data = {
-            "command": "APPEND",
-            "media_id": media_id,
-            "segment_index": "0",
-            "media_data": media_data,
-        }
-        resp = session.post(upload_url, headers=headers, data=append_data, timeout=60)
-        if resp.status_code >= 400:
-            raise MediaUploadError("APPEND failed (HTTP %d): %s" % (resp.status_code, resp.text[:300]))
-        logger.info("Media APPEND: segment 0 uploaded")
+            while True:
+                media_bytes = f.read(self._VIDEO_CHUNK_SIZE if is_video else None)
+                if not media_bytes:
+                    break
+                media_data = base64.b64encode(media_bytes).decode("ascii")
+                headers = self._build_headers(url=upload_url, method="POST")
+                headers.pop("Content-Type", None)
+                append_data = {
+                    "command": "APPEND",
+                    "media_id": media_id,
+                    "segment_index": str(segment_index),
+                    "media_data": media_data,
+                }
+                resp = session.post(
+                    upload_url, headers=headers, data=append_data, timeout=300 if is_video else 60
+                )
+                if resp.status_code >= 400:
+                    raise MediaUploadError(
+                        "APPEND segment %d failed (HTTP %d): %s"
+                        % (segment_index, resp.status_code, resp.text[:300])
+                    )
+                logger.info("Media APPEND: segment %d uploaded", segment_index)
+                segment_index += 1
+                if not is_video:
+                    break
 
         # ── FINALIZE ─────────────────────────────────────────────────
         headers = self._build_headers(url=upload_url, method="POST")
@@ -557,16 +968,61 @@ class TwitterClient:
             raise MediaUploadError("FINALIZE failed (HTTP %d): %s" % (resp.status_code, resp.text[:300]))
         logger.info("Media FINALIZE: media_id=%s ready", media_id)
 
+        # ── STATUS (whenever FINALIZE returns processing_info, e.g. video/GIF) ──
+        try:
+            finalize_result = json.loads(resp.text)
+        except (json.JSONDecodeError, ValueError):
+            finalize_result = {}
+        info = finalize_result.get("processing_info") if isinstance(finalize_result, dict) else None
+        if isinstance(info, dict):
+            deadline = time.monotonic() + self._VIDEO_PROCESS_TIMEOUT
+            while isinstance(info, dict) and info.get("state") not in (None, "succeeded"):
+                state = info.get("state")
+                if state == "failed":
+                    raise MediaUploadError(
+                        "Media processing failed: %s" % json.dumps(info.get("error", info))
+                    )
+                raw_wait = info.get("check_after_secs")
+                try:
+                    wait = max(1.0, float(raw_wait)) if raw_wait is not None else 3.0
+                except (TypeError, ValueError):
+                    wait = 3.0
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise MediaUploadError(
+                        "Media processing timed out after %ds" % self._VIDEO_PROCESS_TIMEOUT
+                    )
+                time.sleep(min(wait, remaining))
+                if time.monotonic() >= deadline:
+                    raise MediaUploadError(
+                        "Media processing timed out after %ds" % self._VIDEO_PROCESS_TIMEOUT
+                    )
+                headers = self._build_headers(url=upload_url, method="GET")
+                resp = session.get(
+                    upload_url,
+                    headers=headers,
+                    params={"command": "STATUS", "media_id": media_id},
+                    timeout=30,
+                )
+                if resp.status_code >= 400:
+                    raise MediaUploadError(
+                        "STATUS failed (HTTP %d): %s" % (resp.status_code, resp.text[:300])
+                    )
+                try:
+                    status_result = json.loads(resp.text)
+                except (json.JSONDecodeError, ValueError):
+                    raise MediaUploadError("STATUS returned invalid JSON")
+                info = status_result.get("processing_info") if isinstance(status_result, dict) else None
+            logger.info("Media STATUS: processing complete")
+
         return media_id
 
     def create_tweet(self, text, reply_to_id=None, media_ids=None):
         # type: (str, Optional[str], Optional[List[str]]) -> str
         """Post a new tweet.  Returns the new tweet ID.
 
-        Args:
-            text: Tweet text content.
-            reply_to_id: Optional tweet ID to reply to.
-            media_ids: Optional list of media IDs (from upload_media) to attach.
+        Posts exceeding 280 weighted characters automatically route through
+        CreateNoteTweet for X Premium long-form posts.
         """
         media_entities = []
         if media_ids:
@@ -576,18 +1032,20 @@ class TwitterClient:
             "media": {"media_entities": media_entities, "possibly_sensitive": False},
             "semantic_annotation_ids": [],
             "dark_request": False,
+            "includePromotedContent": False,
         }  # type: Dict[str, Any]
         if reply_to_id:
             variables["reply"] = {
                 "in_reply_to_tweet_id": reply_to_id,
                 "exclude_reply_user_ids": [],
             }
-        data = self._graphql_post("CreateTweet", variables, FEATURES)
+        operation_name, features = _prepare_tweet_create(text, variables)
+        data = self._graphql_post(operation_name, variables, features)
         self._write_delay()
-        result = _deep_get(data, "data", "create_tweet", "tweet_results", "result")
+        result = _created_tweet_result(data)
         if result:
             return result.get("rest_id", "")
-        raise TwitterAPIError(0, "Failed to create tweet")
+        raise TwitterAPIError(0, "Failed to create tweet (op=%s)" % operation_name)
 
     def delete_tweet(self, tweet_id):
         # type: (str) -> bool
@@ -711,13 +1169,15 @@ class TwitterClient:
             "media": {"media_entities": media_entities, "possibly_sensitive": False},
             "semantic_annotation_ids": [],
             "dark_request": False,
+            "includePromotedContent": False,
         }
-        data = self._graphql_post("CreateTweet", variables, FEATURES)
+        operation_name, features = _prepare_tweet_create(text, variables)
+        data = self._graphql_post(operation_name, variables, features)
         self._write_delay()
-        result = _deep_get(data, "data", "create_tweet", "tweet_results", "result")
+        result = _created_tweet_result(data)
         if result:
             return result.get("rest_id", "")
-        raise TwitterAPIError(0, "Failed to create quote tweet")
+        raise TwitterAPIError(0, "Failed to create quote tweet (op=%s)" % operation_name)
 
     def follow_user(self, user_id):
         # type: (str) -> bool
@@ -749,8 +1209,8 @@ class TwitterClient:
 
     # ── Internal: timeline / user list fetchers ──────────────────────
 
-    def _fetch_timeline(self, operation_name, count, get_instructions, extra_variables=None, override_base_variables=False, field_toggles=None, use_post=False, include_promoted=False, start_cursor=None, return_cursor=False):
-        # type: (str, int, Callable[[Any], Any], Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool, bool, Optional[str], bool) -> Any
+    def _fetch_timeline(self, operation_name, count, get_instructions, extra_variables=None, override_base_variables=False, field_toggles=None, use_post=False, include_promoted=False, start_cursor=None, return_cursor=False, truncate=True):
+        # type: (str, int, Callable[[Any], Any], Optional[Dict[str, Any]], bool, Optional[Dict[str, Any]], bool, bool, Optional[str], bool, bool) -> Any
         """Generic timeline fetcher with pagination and deduplication.
 
         Args:
@@ -759,9 +1219,10 @@ class TwitterClient:
                 endpoints like SearchTimeline that reject unknown variables.
             use_post: If True, send request via POST instead of GET. Required for
                 endpoints like SearchTimeline that Twitter migrated to POST.
+            truncate: If True (default), slice returned tweets to ``count``.
         """
         if count <= 0:
-            return []
+            return ([], None) if return_cursor else []
 
         # Enforce max count cap
         count = min(count, self._max_count)
@@ -820,16 +1281,27 @@ class TwitterClient:
                 logger.debug("Sleeping %.1fs between requests", jitter)
                 time.sleep(jitter)
 
+        result_tweets = tweets[:count] if truncate else tweets
         if return_cursor:
-            return tweets[:count], continuation_cursor
-        return tweets[:count]
+            return result_tweets, continuation_cursor
+        return result_tweets
 
     def _fetch_user_list(self, operation_name, user_id, count, get_instructions, use_post=False):
         # type: (str, str, int, Callable[[Any], Any], bool) -> List[UserProfile]
-        """Generic user list fetcher (for followers/following) with pagination."""
+        """Generic user list fetcher (for followers/following) with pagination.
+
+        Honours explicit ``count`` requests up to ``_ABSOLUTE_MAX_COUNT`` instead
+        of clamping to ``rateLimit.maxCount`` (issue #50).
+        """
         if count <= 0:
             return []
-        count = min(count, self._max_count)
+        if count > _ABSOLUTE_MAX_COUNT:
+            logger.warning(
+                "Requested %d users exceeds the safety ceiling; fetching %d",
+                count,
+                _ABSOLUTE_MAX_COUNT,
+            )
+            count = _ABSOLUTE_MAX_COUNT
         users = []  # type: List[UserProfile]
         seen_ids = set()  # type: Set[str]
         cursor = None  # type: Optional[str]
@@ -898,28 +1370,32 @@ class TwitterClient:
 
     def _graphql_get(self, operation_name, variables, features, field_toggles=None):
         # type: (str, Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]) -> Dict[str, Any]
-        """Issue GraphQL GET request with automatic stale-fallback retry."""
+        """Issue GraphQL GET request with automatic stale-queryId retry."""
         query_id = _resolve_query_id(operation_name, prefer_fallback=True, url_fetch_fn=_url_fetch)
-        using_fallback = query_id == FALLBACK_QUERY_IDS.get(operation_name)
         url = _build_graphql_url(query_id, operation_name, variables, features, field_toggles)
 
         try:
             return self._api_get(url)
         except TwitterAPIError as exc:
-            # Fallback query IDs can go stale. Retry with live lookup if 404/422.
-            if exc.status_code in (404, 422) and using_fallback:
-                logger.info("Retrying %s with live queryId after %d", operation_name, exc.status_code)
+            # Stale queryIds surface as HTTP 404/422 or GraphQL "Query: Unspecified".
+            if _is_stale_query_error(exc):
+                logger.info("Retrying %s with live queryId after stale-query response", operation_name)
                 _invalidate_query_id(operation_name)
-                refreshed_query_id = _resolve_query_id(operation_name, prefer_fallback=False, url_fetch_fn=_url_fetch)
-                retry_url = _build_graphql_url(refreshed_query_id, operation_name, variables, features, field_toggles)
-                return self._api_get(retry_url)
+                refreshed_query_id = _resolve_query_id(
+                    operation_name,
+                    prefer_fallback=False,
+                    url_fetch_fn=_url_fetch,
+                    exclude_ids={query_id},
+                )
+                if refreshed_query_id != query_id:
+                    retry_url = _build_graphql_url(refreshed_query_id, operation_name, variables, features, field_toggles)
+                    return self._api_get(retry_url)
             raise
 
     def _graphql_post(self, operation_name, variables, features=None):
         # type: (str, Dict[str, Any], Optional[Dict[str, Any]]) -> Dict[str, Any]
-        """Issue GraphQL POST request with automatic stale-fallback retry."""
+        """Issue GraphQL POST request with automatic stale-queryId retry."""
         query_id = _resolve_query_id(operation_name, prefer_fallback=True, url_fetch_fn=_url_fetch)
-        using_fallback = query_id == FALLBACK_QUERY_IDS.get(operation_name)
 
         def _do_post(qid):
             # type: (str) -> Dict[str, Any]
@@ -932,11 +1408,17 @@ class TwitterClient:
         try:
             return _do_post(query_id)
         except TwitterAPIError as exc:
-            if exc.status_code in (404, 422) and using_fallback:
-                logger.info("Retrying POST %s with live queryId after %d", operation_name, exc.status_code)
+            if _is_stale_query_error(exc):
+                logger.info("Retrying POST %s with live queryId after stale-query response", operation_name)
                 _invalidate_query_id(operation_name)
-                refreshed = _resolve_query_id(operation_name, prefer_fallback=False, url_fetch_fn=_url_fetch)
-                return _do_post(refreshed)
+                refreshed = _resolve_query_id(
+                    operation_name,
+                    prefer_fallback=False,
+                    url_fetch_fn=_url_fetch,
+                    exclude_ids={query_id},
+                )
+                if refreshed != query_id:
+                    return _do_post(refreshed)
             raise
 
     # ── Internal: HTTP request engine ────────────────────────────────
@@ -1066,28 +1548,45 @@ class TwitterClient:
 
     def _save_ct_cache(self, home_html, ondemand_text):
         # type: (str, str) -> None
-        """Save transaction data to cache file."""
+        """Save transaction data to cache file with owner-only permissions."""
         try:
             cache_path = self._ct_cache_path()
             cache_dir = os.path.dirname(cache_path)
-            os.makedirs(cache_dir, exist_ok=True)
+            os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+            _tighten_dir(Path(cache_dir))
             cache = {
                 "home_html": home_html,
                 "ondemand_text": ondemand_text,
                 "created_at": time.time(),
             }
-            with open(cache_path, "w", encoding="utf-8") as f:
+            with _open_owner_only(Path(cache_path)) as f:
                 json.dump(cache, f)
             logger.debug("Saved CT cache to %s", cache_path)
         except Exception as exc:
             logger.debug("Failed to save CT cache: %s", exc)
 
+    def _ct_bootstrap_cookie(self):
+        # type: () -> Optional[str]
+        """Return session cookie header for authenticated bootstrap, if available."""
+        cookie_string = getattr(self, "_cookie_string", None)
+        if cookie_string:
+            return cookie_string
+        auth_token = getattr(self, "_auth_token", "")
+        ct0 = getattr(self, "_ct0", "")
+        if auth_token and ct0:
+            return "auth_token=%s; ct0=%s" % (auth_token, ct0)
+        return None
+
     def _ensure_client_transaction(self):
         # type: () -> None
         """Initialize ClientTransaction for x-client-transaction-id header.
 
-        Tries cache first (1h TTL), then fetches fresh data from x.com.
-        Also attempts to extract live feature flags from JS bundles.
+        Tries cache first (1h TTL), then fetches fresh responsive-web bootstrap
+        HTML from x.com. Prefers unauthenticated ``https://x.com/i/jf/`` first
+        (avoids sending session cookies or caching authenticated HTML on disk)
+        and falls back to authenticated ``https://x.com/home`` if needed.
+        Validates the full ``ClientTransaction(...)`` initialization inside the
+        candidate loop so an incomplete/interstitial page cleanly falls back.
         """
         if self._ct_init_attempted:
             return
@@ -1097,35 +1596,72 @@ class TwitterClient:
         if self._load_ct_cache():
             return
 
+        last_exc: Optional[Exception] = None
         try:
             # Use curl_cffi for ClientTransaction init to maintain consistent
             # Chrome TLS fingerprint. Using Python requests here would leak
             # a different TLS fingerprint on the same IP — a detection vector.
             cffi_session = _get_cffi_session()
-            ct_headers = _gen_ct_headers()
-            home_page = cffi_session.get(
-                "https://x.com", headers=ct_headers, timeout=10,
-            )
-            home_page_response = bs4.BeautifulSoup(home_page.content, "html.parser")
-            ondemand_url = get_ondemand_file_url(response=home_page_response)
-            if not ondemand_url:
-                raise ValueError("Failed to extract ondemand file URL from homepage")
-            ondemand_file = cffi_session.get(
-                ondemand_url, headers=ct_headers, timeout=10,
-            )
-            self._client_transaction = ClientTransaction(
-                home_page_response=home_page_response,
-                ondemand_file_response=ondemand_file.text,
-            )
-            logger.info("ClientTransaction initialized for x-client-transaction-id")
+            base_headers = dict(_gen_ct_headers())
+            cookie_header = self._ct_bootstrap_cookie()
 
-            # Try to extract live FEATURES from the homepage JS bundles
-            _update_features_from_html(home_page.text)
+            candidates = [("https://x.com/i/jf/", dict(base_headers), False)]
+            if cookie_header:
+                auth_headers = dict(base_headers)
+                auth_headers["Cookie"] = cookie_header
+                candidates.append(("https://x.com/home", auth_headers, True))
 
-            # Save to cache for future use
-            self._save_ct_cache(home_page.text, ondemand_file.text)
+            for bootstrap_url, req_headers, is_authenticated in candidates:
+                try:
+                    resp = cffi_session.get(bootstrap_url, headers=req_headers, timeout=10)
+                    resp_status = getattr(resp, "status_code", 200)
+                    if isinstance(resp_status, int) and resp_status >= 400:
+                        raise ValueError("HTTP %s from %s" % (resp_status, bootstrap_url))
+                    soup = bs4.BeautifulSoup(resp.content, "html.parser")
+                    ondemand_url = get_ondemand_file_url(response=soup)
+                    if not ondemand_url:
+                        raise ValueError("No ondemand.s URL found at %s" % bootstrap_url)
+
+                    # Fetch ondemand JS bundle without session cookies (CDN asset).
+                    ondemand_file = cffi_session.get(
+                        ondemand_url, headers=base_headers, timeout=10,
+                    )
+                    ondemand_status = getattr(ondemand_file, "status_code", 200)
+                    if isinstance(ondemand_status, int) and ondemand_status >= 400:
+                        raise ValueError(
+                            "HTTP %s from %s" % (ondemand_status, ondemand_url)
+                        )
+                    ct = ClientTransaction(
+                        home_page_response=soup,
+                        ondemand_file_response=ondemand_file.text,
+                    )
+                    self._client_transaction = ct
+                    logger.info(
+                        "ClientTransaction initialized for x-client-transaction-id (via %s)",
+                        bootstrap_url,
+                    )
+                    _update_features_from_html(resp.text)
+                    # Only cache unauthenticated HTML to disk to avoid persisting
+                    # account state from authenticated /home payloads.
+                    if not is_authenticated:
+                        self._save_ct_cache(resp.text, ondemand_file.text)
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    logger.debug(
+                        "ClientTransaction bootstrap candidate %s failed: %s", bootstrap_url, exc
+                    )
+                    continue
+
+            raise last_exc or ValueError("Failed to initialize ClientTransaction from x.com")
         except Exception as exc:
-            logger.warning("Failed to init ClientTransaction: %s", exc)
+            logger.warning(
+                "Failed to init ClientTransaction: %s — x-client-transaction-id is "
+                "UNAVAILABLE. Write requests will be REFUSED (unsigned POSTs risk "
+                "account flags/suspension). Run `twitter doctor` to diagnose, or set "
+                "TWITTER_ALLOW_UNSIGNED=1 to override at your own risk.",
+                exc,
+            )
 
     def _build_headers(self, url="", method="GET"):
         # type: (str, str) -> Dict[str, str]
@@ -1159,14 +1695,30 @@ class TwitterClient:
             headers["Content-Type"] = "application/json"
             headers["Referer"] = "https://x.com/compose/post"
             headers["Priority"] = "u=1, i"
-        # Generate x-client-transaction-id if available
+        # Generate x-client-transaction-id. X gates writes and POST queries on
+        # this header; an unsigned POST is treated as automation and can trigger
+        # 344 errors or account suspension. Fail CLOSED by default.
+        tid = None
         if self._client_transaction and url:
             try:
                 path = urllib.parse.urlparse(url).path
                 tid = self._client_transaction.generate_transaction_id(
                     method=method, path=path,
                 )
-                headers["X-Client-Transaction-Id"] = tid
             except Exception as exc:
                 logger.debug("Failed to generate transaction id: %s", exc)
+        if tid:
+            headers["X-Client-Transaction-Id"] = tid
+        elif method == "POST":
+            msg = (
+                "REFUSING unsigned write: x-client-transaction-id is not available "
+                "(ClientTransaction failed to init). X treats unsigned POST requests as "
+                "automation and can flag or suspend the account. Fix the ClientTransaction "
+                "bootstrap, or set TWITTER_ALLOW_UNSIGNED=1 to override at your own risk."
+            )
+            if os.environ.get("TWITTER_ALLOW_UNSIGNED") == "1":
+                logger.warning("%s [overridden by TWITTER_ALLOW_UNSIGNED=1]", msg)
+            else:
+                logger.error("%s", msg)
+                raise TwitterAPIError(0, msg)
         return headers

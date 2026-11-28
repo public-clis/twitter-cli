@@ -11,7 +11,38 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .models import Tweet, UserProfile
-from .timeutil import format_local_time, format_relative_time
+from .timeutil import format_iso8601, format_local_time, format_relative_time
+
+# How timestamps are rendered in human-readable output (issue #35):
+#   relative -> "28s ago", "14d ago"
+#   absolute -> "2026-03-14 21:08"
+#   iso      -> "2026-03-14T21:08:00+00:00"
+_TIME_STYLES = ("relative", "absolute", "iso")
+_TIME_STYLE = "relative"
+
+
+def set_time_style(style: Optional[str]) -> str:
+    """Select the timestamp rendering style; returns the style in effect."""
+    global _TIME_STYLE
+    if style is None:
+        _TIME_STYLE = "relative"
+    elif style in _TIME_STYLES:
+        _TIME_STYLE = style
+    return _TIME_STYLE
+
+
+def get_time_style() -> str:
+    """Return the timestamp rendering style currently in effect."""
+    return _TIME_STYLE
+
+
+def _render_time(created_at: str) -> str:
+    """Render one timestamp according to the selected style."""
+    if _TIME_STYLE == "absolute":
+        return format_local_time(created_at)
+    if _TIME_STYLE == "iso":
+        return format_iso8601(created_at)
+    return format_relative_time(created_at)
 
 
 def _make_console() -> Console:
@@ -48,11 +79,12 @@ def print_tweet_table(
     if not title:
         title = "📱 Twitter — %d tweets" % len(tweets)
 
+    stats_width = 29 if _TIME_STYLE == "iso" else 22
     table = Table(title=title, show_lines=True, expand=True)
     table.add_column("#", style="dim", width=3, justify="right")
     table.add_column("Author", style="cyan", width=18, no_wrap=True)
     table.add_column("Tweet", ratio=3)
-    table.add_column("Stats", style="green", width=22, no_wrap=True)
+    table.add_column("Stats", style="green", width=stats_width, no_wrap=True)
     table.add_column("Score", style="yellow", width=6, justify="right")
 
     for i, tweet in enumerate(tweets):
@@ -91,7 +123,7 @@ def print_tweet_table(
         text += "\n🔗 x.com/%s/status/%s" % (tweet.author.screen_name, tweet.id)
 
         # Stats
-        rel_time = format_relative_time(tweet.created_at)
+        rel_time = _render_time(tweet.created_at)
         stats = (
             "❤️ %s  🔄 %s\n💬 %s  👁️ %s\n🕐 %s"
             % (
@@ -155,10 +187,14 @@ def print_tweet_detail(tweet: Tweet, console: Optional[Console] = None) -> None:
         )
     )
     local_time = format_local_time(tweet.created_at)
-    rel_time = format_relative_time(tweet.created_at)
+    rel_time = _render_time(tweet.created_at)
+    if _TIME_STYLE == "relative":
+        time_text = "%s (%s)" % (local_time, rel_time)
+    else:
+        time_text = local_time if _TIME_STYLE == "absolute" else rel_time
     body_parts.append(
-        "🕐 %s (%s) · https://x.com/%s/status/%s"
-        % (local_time, rel_time, tweet.author.screen_name, tweet.id)
+        "🕐 %s · https://x.com/%s/status/%s"
+        % (time_text, tweet.author.screen_name, tweet.id)
     )
 
     console.print(Panel(
@@ -200,7 +236,7 @@ def print_article(tweet: Tweet, console: Optional[Console] = None) -> None:
     title = tweet.article_title or "Twitter Article"
     meta_parts = [
         "By @%s%s (%s)" % (tweet.author.screen_name, verified, tweet.author.name),
-        "🕐 %s" % tweet.created_at,
+        "🕐 %s" % _render_time(tweet.created_at),
         "🔗 x.com/%s/status/%s" % (tweet.author.screen_name, tweet.id),
         "",
         "❤️ %s  🔄 %s  💬 %s  🔖 %s  👁️ %s"

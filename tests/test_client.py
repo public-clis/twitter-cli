@@ -207,8 +207,8 @@ class TestBuildGraphqlUrl:
         assert len(url) < 8000, f"URL too long: {len(url)} chars"
 
     def test_searchtimeline_fallback_query_id_regression(self):
-        """Keep SearchTimeline fallback aligned with the live operation after issue #39."""
-        assert FALLBACK_QUERY_IDS["SearchTimeline"] == "VhUd6vHVmLBcw0uX-6jMLA"
+        """Keep SearchTimeline fallback aligned with the live operation."""
+        assert FALLBACK_QUERY_IDS["SearchTimeline"] == "vLHjqbDv7TPFMBkIIO1nOA"
 
 
 # ── _best_chrome_target ──────────────────────────────────────────────────
@@ -1356,7 +1356,9 @@ class TestUploadMedia:
         client._max_retries = 3
         client._retry_base_delay = 5.0
         client._max_count = 200
-        client._client_transaction = None
+        # media upload is a POST: it needs a transaction id like any other write
+        client._client_transaction = MagicMock()
+        client._client_transaction.generate_transaction_id.return_value = "tid-media"
         client._ct_init_attempted = True
         return client
 
@@ -1496,7 +1498,9 @@ class TestFetchSearchUsesPost:
         client._max_retries = 0
         client._retry_base_delay = 0
         client._max_count = 200
-        client._client_transaction = None
+        # media upload is a POST: it needs a transaction id like any other write
+        client._client_transaction = MagicMock()
+        client._client_transaction.generate_transaction_id.return_value = "tid-media"
         client._ct_init_attempted = True
         return client
 
@@ -1545,3 +1549,660 @@ class TestFetchSearchUsesPost:
 
         assert captured.get("product") == "Latest"
         assert captured.get("querySource") == "typed_query"
+
+
+# ── Stale queryId retry & resolution ─────────────────────────────────────
+
+
+class TestStaleQueryRetry:
+    def test_graphql_get_retries_query_unspecified_with_live_id(self):
+        client = TwitterClient.__new__(TwitterClient)
+        fallback = FALLBACK_QUERY_IDS["HomeTimeline"]
+        urls = []
+
+        def api_get(url):
+            urls.append(url)
+            if len(urls) == 1:
+                raise TwitterAPIError(0, "Twitter API returned errors: Query: Unspecified")
+            return {"data": {"home": {}}}
+
+        client._api_get = api_get
+
+        with (
+            patch(
+                "twitter_cli.client._resolve_query_id",
+                side_effect=[fallback, "live-query-id"],
+            ) as resolve,
+            patch("twitter_cli.client._invalidate_query_id") as invalidate,
+        ):
+            result = client._graphql_get("HomeTimeline", {"count": 3}, FEATURES)
+
+        assert result == {"data": {"home": {}}}
+        assert fallback in urls[0]
+        assert "live-query-id" in urls[1]
+        assert resolve.call_count == 2
+        assert resolve.call_args_list[1].kwargs["prefer_fallback"] is False
+        invalidate.assert_called_once_with("HomeTimeline")
+
+    def test_graphql_post_retries_query_unspecified_with_live_id(self):
+        client = TwitterClient.__new__(TwitterClient)
+        fallback = FALLBACK_QUERY_IDS["CreateTweet"]
+        requests = []
+
+        def api_request(url, method="GET", body=None):
+            requests.append((url, method, body))
+            if len(requests) == 1:
+                raise TwitterAPIError(0, "Twitter API returned errors: Query: Unspecified")
+            return {"data": {"create_tweet": {}}}
+
+        client._api_request = api_request
+
+        with (
+            patch(
+                "twitter_cli.client._resolve_query_id",
+                side_effect=[fallback, "live-query-id"],
+            ),
+            patch("twitter_cli.client._invalidate_query_id") as invalidate,
+        ):
+            result = client._graphql_post("CreateTweet", {"tweet_text": "hello"}, FEATURES)
+
+        assert result == {"data": {"create_tweet": {}}}
+        assert requests[0][2]["queryId"] == fallback
+        assert requests[1][2]["queryId"] == "live-query-id"
+        invalidate.assert_called_once_with("CreateTweet")
+
+    def test_graphql_get_does_not_retry_unrelated_status_zero_error(self):
+        client = TwitterClient.__new__(TwitterClient)
+        fallback = FALLBACK_QUERY_IDS["HomeTimeline"]
+        client._api_get = MagicMock(
+            side_effect=TwitterAPIError(0, "Twitter API network error: timeout")
+        )
+
+        with (
+            patch("twitter_cli.client._resolve_query_id", return_value=fallback) as resolve,
+            patch("twitter_cli.client._invalidate_query_id") as invalidate,
+            pytest.raises(TwitterAPIError),
+        ):
+            client._graphql_get("HomeTimeline", {"count": 3}, FEATURES)
+
+        resolve.assert_called_once()
+        invalidate.assert_not_called()
+
+
+class TestQueryIdResolution:
+    def test_env_override_takes_precedence(self, monkeypatch):
+        from twitter_cli import graphql
+
+        monkeypatch.setenv("TWITTER_QID_SearchTimeline", "pinned-search-qid")
+        assert graphql._resolve_query_id("SearchTimeline") == "pinned-search-qid"
+
+    def test_disk_cache_roundtrip_and_invalidation(self, monkeypatch, tmp_path):
+        import json
+        from twitter_cli import graphql
+
+        cache_file = tmp_path / "query_ids_cache.json"
+        monkeypatch.setattr(graphql, "_qid_cache_path", lambda: cache_file)
+        monkeypatch.setattr(graphql, "_cached_query_ids", {})
+        monkeypatch.setattr(graphql, "_disk_cache_loaded", False)
+
+        graphql._save_disk_query_ids({"HomeTimeline": "disk-cached-id"})
+        assert cache_file.exists()
+
+        resolved = graphql._resolve_query_id("HomeTimeline", prefer_fallback=True)
+        assert resolved == "disk-cached-id"
+
+        graphql._invalidate_query_id("HomeTimeline")
+        assert "HomeTimeline" not in graphql._cached_query_ids
+        assert "HomeTimeline" not in json.loads(cache_file.read_text(encoding="utf-8"))["query_ids"]
+
+    def test_scan_bundles_follows_xweb_assets(self, monkeypatch, tmp_path):
+        from twitter_cli import graphql
+
+        cache_file = tmp_path / "query_ids_cache.json"
+        monkeypatch.setattr(graphql, "_qid_cache_path", lambda: cache_file)
+        monkeypatch.setattr(graphql, "_cached_query_ids", {})
+        monkeypatch.setattr(graphql, "_bundles_scanned", False)
+
+        def fake_fetch(url, headers=None):
+            if url == "https://x.com/i/jf/":
+                return '<script src="https://abs.twimg.com/x-web/x-web/entry-client.js"></script>'
+            if url == "https://abs.twimg.com/x-web/x-web/entry-client.js":
+                return 'const deps=["./assets/chunk-abc.js"];'
+            if url == "https://abs.twimg.com/x-web/x-web/assets/chunk-abc.js":
+                return 'queryId:"freshQid123",operationName:"SearchTimeline"'
+            raise RuntimeError("unexpected url: " + url)
+
+        graphql._scan_bundles(fake_fetch)
+        assert graphql._cached_query_ids["SearchTimeline"] == "freshQid123"
+
+
+# ── ClientTransaction bootstrap (x-client-transaction-id) ───────────────
+
+_CT_HOME_HTML = (
+    '<html><head>'
+    '<meta name="twitter-site-verification" content="MTIzNDU2Nzg5MGFiY2RlZmI="/>'
+    '</head><body>'
+    '<script>window.__M={0:"unused",59924:"ondemand.s",60041:"i18n"}</script>'
+    '<script>window.__H={0:"0000000000000000",59924:"38289b77fa31a72c",60041:"deadbeef12345678"}</script>'
+    '<svg id="loading-x-anim-0"><g><path d="M0 0 C 10 20, 30 40, 50 60 70 80, 90 100, 110 120"/></g></svg>'
+    '<svg id="loading-x-anim-1"><g><path d="M0 0 C 5 10, 15 25, 25 35 45 45, 55 55, 65 65"/></g></svg>'
+    '<svg id="loading-x-anim-2"><g><path d="M1 1 C 2 2, 3 3, 4 4 5 5, 6 6, 7 7"/></g></svg>'
+    '<svg id="loading-x-anim-3"><g><path d="M2 2 C 3 3, 4 4, 5 5 6 6, 7 7, 8 8"/></g></svg>'
+    '</body></html>'
+)
+
+_CT_STRIPPED_HTML = "<html><body><script>window.__STRIPPED=1;</script></body></html>"
+
+_CT_ONDEMAND_JS = (
+    "var a=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,"
+    "26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45];"
+    "var b=function(c){return(a[(c[0], 16)],(a[(c[1], 17)]),(a[(c[2], 18)]),"
+    "(a[(c[3], 19)]),(a[(c[4], 20)]));};var d=b(a);"
+)
+
+
+class TestClientTransactionBootstrap:
+    def _make_client(self, cookie_string=None):
+        client = TwitterClient.__new__(TwitterClient)
+        client._auth_token = "auth_tok"
+        client._ct0 = "ct0_val"
+        client._cookie_string = cookie_string
+        client._client_transaction = None
+        client._ct_init_attempted = False
+        client._load_ct_cache = MagicMock(return_value=False)
+        client._save_ct_cache = MagicMock()
+        return client
+
+    @patch("twitter_cli.client._update_features_from_html")
+    @patch("twitter_cli.client.ClientTransaction")
+    @patch("twitter_cli.client._gen_ct_headers", return_value={"Referer": "https://x.com"})
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_bootstraps_from_i_jf_without_cookie_first(
+        self, mock_session, _mock_ct_headers, mock_tx, _mock_features
+    ):
+        import bs4
+
+        jf_page = MagicMock(status_code=200, content=_CT_HOME_HTML.encode("utf-8"), text=_CT_HOME_HTML)
+        ondemand_page = MagicMock(status_code=200, text=_CT_ONDEMAND_JS)
+        mock_session.return_value.get.side_effect = [jf_page, ondemand_page]
+
+        client = self._make_client(cookie_string="auth_token=auth_tok; ct0=ct0_val")
+        client._ensure_client_transaction()
+
+        first = mock_session.return_value.get.call_args_list[0]
+        second = mock_session.return_value.get.call_args_list[1]
+        assert first.args[0] == "https://x.com/i/jf/"
+        assert "Cookie" not in first.kwargs["headers"]
+        assert second.args[0] == (
+            "https://abs.twimg.com/responsive-web/client-web/"
+            "ondemand.s.38289b77fa31a72ca.js"
+        )
+        # Session cookies must not leak onto the CDN ondemand JS fetch.
+        assert "Cookie" not in second.kwargs["headers"]
+        mock_tx.assert_called_once()
+        assert isinstance(mock_tx.call_args.kwargs["home_page_response"], bs4.BeautifulSoup)
+        client._save_ct_cache.assert_called_once()
+
+    @patch("twitter_cli.client._update_features_from_html")
+    @patch("twitter_cli.client.ClientTransaction")
+    @patch("twitter_cli.client._gen_ct_headers", return_value={"Referer": "https://x.com"})
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_falls_back_to_authenticated_home_when_i_jf_fails_without_caching_auth_html(
+        self, mock_session, _mock_ct_headers, mock_tx, _mock_features
+    ):
+        stripped = MagicMock(status_code=200, content=_CT_STRIPPED_HTML.encode("utf-8"), text=_CT_STRIPPED_HTML)
+        home_page = MagicMock(status_code=200, content=_CT_HOME_HTML.encode("utf-8"), text=_CT_HOME_HTML)
+        ondemand_page = MagicMock(status_code=200, text=_CT_ONDEMAND_JS)
+        mock_session.return_value.get.side_effect = [stripped, home_page, ondemand_page]
+
+        client = self._make_client(cookie_string="auth_token=auth_tok; ct0=ct0_val")
+        client._ensure_client_transaction()
+
+        calls = mock_session.return_value.get.call_args_list
+        assert calls[0].args[0] == "https://x.com/i/jf/"
+        assert "Cookie" not in calls[0].kwargs["headers"]
+        assert calls[1].args[0] == "https://x.com/home"
+        assert calls[1].kwargs["headers"]["Cookie"] == "auth_token=auth_tok; ct0=ct0_val"
+        assert calls[2].args[0] == (
+            "https://abs.twimg.com/responsive-web/client-web/"
+            "ondemand.s.38289b77fa31a72ca.js"
+        )
+        assert "Cookie" not in calls[2].kwargs["headers"]
+        mock_tx.assert_called_once()
+        # Authenticated /home HTML must not be persisted to disk.
+        client._save_ct_cache.assert_not_called()
+
+    def test_real_parser_resolves_ondemand_from_current_layout(self):
+        import bs4
+        from x_client_transaction.utils import get_ondemand_file_url
+
+        soup = bs4.BeautifulSoup(_CT_HOME_HTML, "html.parser")
+        url = get_ondemand_file_url(response=soup)
+        assert url == (
+            "https://abs.twimg.com/responsive-web/client-web/"
+            "ondemand.s.38289b77fa31a72ca.js"
+        )
+
+
+# ── Fail-closed guard for unsigned POSTs ─────────────────────────────────
+
+
+class TestUnsignedWriteGuard:
+    @staticmethod
+    def _client():
+        client = TwitterClient.__new__(TwitterClient)
+        client._auth_token = "test_token"
+        client._ct0 = "test_ct0"
+        client._cookie_string = None
+        client._client_transaction = None
+        client._ct_init_attempted = True
+        return client
+
+    def test_post_without_transaction_id_is_refused(self):
+        client = self._client()
+        with pytest.raises(TwitterAPIError) as exc:
+            client._build_headers("https://x.com/i/api/graphql/qid/CreateTweet", "POST")
+        assert "REFUSING unsigned write" in str(exc.value)
+
+    def test_override_env_allows_unsigned_post(self, monkeypatch):
+        monkeypatch.setenv("TWITTER_ALLOW_UNSIGNED", "1")
+        client = self._client()
+        headers = client._build_headers(
+            "https://x.com/i/api/graphql/qid/CreateTweet", "POST"
+        )
+        assert "X-Client-Transaction-Id" not in headers
+
+    def test_get_without_transaction_id_is_allowed(self):
+        client = self._client()
+        headers = client._build_headers(
+            "https://x.com/i/api/graphql/qid/HomeTimeline", "GET"
+        )
+        assert "X-Client-Transaction-Id" not in headers
+        assert "Authorization" in headers
+
+    def test_post_with_transaction_id_sets_header(self):
+        client = self._client()
+        transaction = MagicMock()
+        transaction.generate_transaction_id.return_value = "tid-123"
+        client._client_transaction = transaction
+        headers = client._build_headers(
+            "https://x.com/i/api/graphql/qid/CreateTweet", "POST"
+        )
+        assert headers["X-Client-Transaction-Id"] == "tid-123"
+
+    def test_failing_generator_also_refuses(self):
+        client = self._client()
+        transaction = MagicMock()
+        transaction.generate_transaction_id.side_effect = RuntimeError("boom")
+        client._client_transaction = transaction
+        with pytest.raises(TwitterAPIError):
+            client._build_headers("https://x.com/i/api/graphql/qid/CreateTweet", "POST")
+
+
+class TestTweetDetailFetch:
+    def test_raises_when_focal_tweet_is_missing(self):
+        from twitter_cli.exceptions import NotFoundError
+
+        client = TwitterClient.__new__(TwitterClient)
+        client._fetch_timeline = MagicMock(return_value=[MagicMock(id="reply-1")])
+
+        with pytest.raises(
+            NotFoundError,
+            match="Tweet 123 was not returned by the TweetDetail response",
+        ):
+            client.fetch_tweet_detail("123", 20)
+
+    def test_places_focal_tweet_before_replies(self):
+        client = TwitterClient.__new__(TwitterClient)
+        reply = MagicMock(id="reply-1")
+        focal_tweet = MagicMock(id="123")
+        client._fetch_timeline = MagicMock(return_value=[reply, focal_tweet])
+
+        tweets = client.fetch_tweet_detail("123", 20)
+
+        assert tweets == [focal_tweet, reply]
+
+    def test_supports_cursor_and_return_cursor(self):
+        client = TwitterClient.__new__(TwitterClient)
+        reply = MagicMock(id="reply-2")
+        client._fetch_timeline = MagicMock(return_value=([reply], "next-cur"))
+
+        tweets, next_cursor = client.fetch_tweet_detail(
+            "123", 20, cursor="prev-cur", return_cursor=True
+        )
+
+        assert tweets == [reply]
+        assert next_cursor == "next-cur"
+
+
+class TestFetchUserByNumericId:
+    def test_fetch_user_routes_numeric_id_to_user_by_rest_id(self):
+        client = TwitterClient.__new__(TwitterClient)
+        calls = []
+
+        def mock_get(operation_name, variables, features, field_toggles=None):
+            calls.append((operation_name, variables))
+            return {
+                "data": {
+                    "user": {
+                        "result": {
+                            "rest_id": "44196397",
+                            "core": {"name": "Elon Musk", "screen_name": "elonmusk"},
+                            "relationship_counts": {"followers": 1000, "following": 50},
+                        }
+                    }
+                }
+            }
+
+        client._graphql_get = mock_get
+        profile = client.fetch_user("44196397")
+        assert calls[0][0] == "UserByRestId"
+        assert calls[0][1]["userId"] == "44196397"
+        assert profile.screen_name == "elonmusk"
+        assert profile.followers_count == 1000
+
+
+class TestFetchExploreNews:
+    def test_fetch_explore_news_uses_news_timeline_id(self):
+        client = TwitterClient.__new__(TwitterClient)
+        client._max_count = 200
+        calls = []
+
+        def mock_graphql_get(operation_name, variables, features, field_toggles=None):
+            calls.append((operation_name, variables))
+            if operation_name == "ExplorePage":
+                return {
+                    "data": {
+                        "explore_page": {
+                            "body": {
+                                "timelines": [
+                                    {"id": "for_you", "timeline": {"id": "for-you-id"}},
+                                    {"id": "news", "timeline": {"id": "news-id"}},
+                                ]
+                            }
+                        }
+                    }
+                }
+            if operation_name == "GenericTimelineById":
+                assert variables["timelineId"] == "news-id"
+                return {
+                    "data": {
+                        "timeline": {
+                            "timeline": {
+                                "instructions": [
+                                    {
+                                        "type": "TimelineAddEntries",
+                                        "entries": [
+                                            {
+                                                "entryId": "stories",
+                                                "content": {
+                                                    "entryType": "TimelineTimelineModule",
+                                                    "items": [
+                                                        {
+                                                            "item": {
+                                                                "itemContent": {
+                                                                    "__typename": "TimelineTrend",
+                                                                    "is_ai_trend": True,
+                                                                    "name": "Major AI story",
+                                                                    "social_context": {
+                                                                        "text": "Trending now · News · 26K posts"
+                                                                    },
+                                                                    "trend_metadata": {
+                                                                        "url": {
+                                                                            "url": "twitter://trending/123",
+                                                                            "urlType": "DeepLink",
+                                                                        }
+                                                                    },
+                                                                }
+                                                            }
+                                                        }
+                                                    ],
+                                                },
+                                            }
+                                        ],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            raise AssertionError(operation_name)
+
+        client._graphql_get = mock_graphql_get
+        stories = client.fetch_explore_news(count=5)
+
+        assert [c[0] for c in calls] == ["ExplorePage", "GenericTimelineById"]
+        assert stories == [
+            {
+                "rank": 1,
+                "title": "Major AI story",
+                "name": "Major AI story",
+                "category": "",
+                "context": "Trending now · News · 26K posts",
+                "query": "Major AI story",
+                "url": "https://x.com/i/trending/123",
+                "post_count": 26000,
+                "trend_id": "123",
+                "is_ai_trend": True,
+                "type": "TimelineTrend",
+            }
+        ]
+
+
+class TestCreateLongFormTweet:
+    @staticmethod
+    def _make_client():
+        client = TwitterClient.__new__(TwitterClient)
+        client._write_delay = lambda: None
+        return client
+
+    def test_standard_tweet_uses_create_tweet(self):
+        from twitter_cli.graphql import NOTE_TWEET_FEATURES
+
+        client = self._make_client()
+        calls = []
+
+        def mock_graphql_post(operation_name, variables, features=None):
+            calls.append((operation_name, variables, features))
+            return {"data": {"create_tweet": {"tweet_results": {"result": {"rest_id": "88"}}}}}
+
+        client._graphql_post = mock_graphql_post
+
+        assert client.create_tweet("x" * 280) == "88"
+        op, variables, features = calls[0]
+        assert op == "CreateTweet"
+        assert "disallowed_reply_options" not in variables
+        assert features is FEATURES
+        assert NOTE_TWEET_FEATURES.keys().isdisjoint(features)
+
+    def test_long_tweet_uses_create_note_tweet(self):
+        from twitter_cli.graphql import NOTE_TWEET_FEATURES
+
+        client = self._make_client()
+        calls = []
+
+        def mock_graphql_post(operation_name, variables, features=None):
+            calls.append((operation_name, variables, features))
+            return {
+                "data": {"notetweet_create": {"tweet_results": {"result": {"rest_id": "99"}}}}
+            }
+
+        client._graphql_post = mock_graphql_post
+
+        assert client.create_tweet("x" * 281, reply_to_id="123") == "99"
+        op, variables, features = calls[0]
+        assert op == "CreateNoteTweet"
+        assert variables["disallowed_reply_options"] is None
+        assert variables["reply"]["in_reply_to_tweet_id"] == "123"
+        assert features == dict(FEATURES, **NOTE_TWEET_FEATURES)
+
+    def test_long_quote_uses_create_note_tweet(self):
+        from twitter_cli.graphql import NOTE_TWEET_FEATURES
+
+        client = self._make_client()
+        calls = []
+
+        def mock_graphql_post(operation_name, variables, features=None):
+            calls.append((operation_name, variables, features))
+            return {
+                "data": {"notetweet_create": {"tweet_results": {"result": {"rest_id": "100"}}}}
+            }
+
+        client._graphql_post = mock_graphql_post
+
+        assert client.quote_tweet("456", "x" * 281) == "100"
+        op, variables, features = calls[0]
+        assert op == "CreateNoteTweet"
+        assert variables["attachment_url"] == "https://x.com/i/status/456"
+        assert features == dict(FEATURES, **NOTE_TWEET_FEATURES)
+
+
+class TestUploadVideo:
+    def _make_client(self):
+        client = TwitterClient.__new__(TwitterClient)
+        client._auth_token = "tok"
+        client._ct0 = "ct0"
+        client._cookie_string = None
+        client._client_transaction = MagicMock()
+        client._client_transaction.generate_transaction_id.return_value = "tid-video"
+        client._ct_init_attempted = True
+        return client
+
+    @patch("twitter_cli.client.time.sleep")
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_upload_video_chunks_and_polls_status(self, mock_session, _mock_sleep, tmp_path):
+        vid = tmp_path / "clip.mp4"
+        # 5 MB -> 3 chunks (2 MB + 2 MB + 1 MB) staying under X's 5 MB base64 segment cap
+        vid.write_bytes(b"\x00" * (5 * 1024 * 1024))
+
+        resp_init = MagicMock(status_code=200, text='{"media_id_string": "vid-999"}')
+        resp_append = MagicMock(status_code=204, text="")
+        resp_finalize = MagicMock(
+            status_code=200,
+            text='{"media_id_string": "vid-999", "processing_info": {"state": "pending", "check_after_secs": 1}}',
+        )
+        resp_status = MagicMock(
+            status_code=200,
+            text='{"media_id_string": "vid-999", "processing_info": {"state": "succeeded"}}',
+        )
+
+        sess = MagicMock()
+        sess.post = MagicMock(
+            side_effect=[resp_init, resp_append, resp_append, resp_append, resp_finalize]
+        )
+        sess.get = MagicMock(return_value=resp_status)
+        mock_session.return_value = sess
+
+        client = self._make_client()
+        media_id = client.upload_media(str(vid))
+
+        assert media_id == "vid-999"
+        assert sess.post.call_count == 5
+        post_datas = [c.kwargs["data"] for c in sess.post.call_args_list]
+        assert [d["command"] for d in post_datas] == ["INIT", "APPEND", "APPEND", "APPEND", "FINALIZE"]
+        assert post_datas[0]["media_category"] == "tweet_video"
+        assert [d["segment_index"] for d in post_datas[1:4]] == ["0", "1", "2"]
+        assert sess.get.call_count == 1
+        assert sess.get.call_args.kwargs["params"] == {"command": "STATUS", "media_id": "vid-999"}
+
+    @patch("twitter_cli.client.time.sleep")
+    @patch("twitter_cli.client._get_cffi_session")
+    def test_upload_video_raises_on_failed_processing(self, mock_session, _mock_sleep, tmp_path):
+        from twitter_cli.exceptions import MediaUploadError
+
+        vid = tmp_path / "bad.mp4"
+        vid.write_bytes(b"\x00" * 100)
+
+        sess = MagicMock()
+        sess.post = MagicMock(
+            side_effect=[
+                MagicMock(status_code=200, text='{"media_id_string": "vid-1"}'),
+                MagicMock(status_code=204, text=""),
+                MagicMock(
+                    status_code=200,
+                    text='{"processing_info": {"state": "failed", "error": {"message": "bad codec"}}}',
+                ),
+            ]
+        )
+        mock_session.return_value = sess
+
+        client = self._make_client()
+        with pytest.raises(MediaUploadError, match="Media processing failed"):
+            client.upload_media(str(vid))
+
+
+class TestCreateArticle:
+    def _make_client(self):
+        client = TwitterClient.__new__(TwitterClient)
+        client._write_delay = lambda: None
+        return client
+
+    def test_create_article_publishes_draft_with_content(self):
+        client = self._make_client()
+        calls = []
+
+        def mock_graphql_post(operation_name, variables, features=None):
+            calls.append((operation_name, variables))
+            if operation_name == "ArticleEntityDraftCreate":
+                return {
+                    "data": {
+                        "articleentity_create_draft": {
+                            "article_entity_results": {"result": {"rest_id": "draft-1"}}
+                        }
+                    }
+                }
+            if operation_name == "ArticleEntityPublish":
+                return {
+                    "data": {
+                        "articleentity_publish": {
+                            "article_entity_results": {"result": {"rest_id": "article-1"}}
+                        }
+                    }
+                }
+            return {"data": {}}
+
+        client._graphql_post = mock_graphql_post
+        result = client.create_article(
+            "Title", {"blocks": [{"text": "Body"}], "entity_map": []}, publish=True
+        )
+
+        assert result == {
+            "id": "article-1",
+            "title": "Title",
+            "url": "https://x.com/i/article/article-1",
+            "published": True,
+        }
+        assert [c[0] for c in calls] == [
+            "ArticleEntityDraftCreate",
+            "ArticleEntityUpdateTitle",
+            "ArticleEntityUpdateContent",
+            "ArticleEntityPublish",
+        ]
+
+    def test_create_article_draft_skips_publish(self):
+        client = self._make_client()
+        calls = []
+
+        def mock_graphql_post(operation_name, variables, features=None):
+            calls.append(operation_name)
+            if operation_name == "ArticleEntityDraftCreate":
+                return {
+                    "data": {
+                        "articleentity_create_draft": {
+                            "article_entity_results": {"result": {"rest_id": "draft-2"}}
+                        }
+                    }
+                }
+            return {"data": {}}
+
+        client._graphql_post = mock_graphql_post
+        result = client.create_article("Draft title", {"blocks": [], "entity_map": []}, publish=False)
+
+        assert result["id"] == "draft-2"
+        assert result["published"] is False
+        assert result["url"] == "https://x.com/compose/article/edit/draft-2"
+        assert calls == [
+            "ArticleEntityDraftCreate",
+            "ArticleEntityUpdateTitle",
+            "ArticleEntityUpdateContent",
+        ]

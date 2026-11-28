@@ -10,6 +10,13 @@ import pytest
 from twitter_cli import auth
 
 
+def _patch_home(monkeypatch, tmp_path) -> None:
+    """Point ``os.path.expanduser("~")`` at ``tmp_path`` on POSIX and Windows."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    if os.name == "nt":
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+
 def test_get_cookies_prefers_env(monkeypatch) -> None:
     monkeypatch.setattr(auth, "load_from_env", lambda: {"auth_token": "env-token", "ct0": "env-csrf"})
     monkeypatch.setattr(auth, "extract_from_browser", lambda: pytest.fail("should not extract from browser"))
@@ -135,7 +142,9 @@ def test_extract_via_subprocess_script_includes_arc(monkeypatch) -> None:
     cookies, diagnostics = auth._extract_via_subprocess()
 
     assert cookies is None
-    assert '"arc": browser_cookie3.arc' in seen["script"]
+    assert 'DEFAULT_ORDER = ["arc", "chrome", "edge", "firefox", "brave", "vivaldi", "zen"]' in seen["script"]
+    assert 'CUSTOM_CHROMIUM_BROWSER = "custom-chromium"' in seen["script"]
+    assert "browser_cookie3.chromium(" in seen["script"]
 
 
 def test_extract_via_subprocess_retries_uv_when_current_env_has_no_output(monkeypatch) -> None:
@@ -192,13 +201,8 @@ def test_verify_cookies_logs_attempt_summary_on_non_auth_failures(monkeypatch, c
 
 def test_iter_chrome_cookie_files_default_first(monkeypatch, tmp_path) -> None:
     """Default profile should be yielded first, then Profile N sorted."""
-    # Create the correct platform-specific directory structure
-    if sys.platform == "darwin":
-        chrome_dir = tmp_path / "Library" / "Application Support" / "Google" / "Chrome"
-    elif sys.platform == "win32":
-        chrome_dir = tmp_path / "Google" / "Chrome" / "User Data"
-    else:
-        chrome_dir = tmp_path / ".config" / "Google" / "Chrome"
+    monkeypatch.setattr(auth.sys, "platform", "linux")
+    chrome_dir = tmp_path / ".config" / "Google" / "Chrome"
 
     (chrome_dir / "Default").mkdir(parents=True)
     (chrome_dir / "Default" / "Cookies").touch()
@@ -208,9 +212,7 @@ def test_iter_chrome_cookie_files_default_first(monkeypatch, tmp_path) -> None:
     (chrome_dir / "Profile 1" / "Cookies").touch()
 
     monkeypatch.delenv("TWITTER_CHROME_PROFILE", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    if sys.platform == "win32":
-        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    _patch_home(monkeypatch, tmp_path)
 
     paths = auth._iter_chrome_cookie_files("chrome")
 
@@ -224,17 +226,15 @@ def test_iter_chrome_cookie_files_default_first(monkeypatch, tmp_path) -> None:
 
 def test_iter_chrome_cookie_files_env_override(monkeypatch, tmp_path) -> None:
     """TWITTER_CHROME_PROFILE should restrict to that single profile."""
-    if sys.platform == "darwin":
-        chrome_dir = tmp_path / "Library" / "Application Support" / "Google" / "Chrome"
-    else:
-        chrome_dir = tmp_path / ".config" / "Google" / "Chrome"
+    monkeypatch.setattr(auth.sys, "platform", "linux")
+    chrome_dir = tmp_path / ".config" / "Google" / "Chrome"
 
     (chrome_dir / "Default").mkdir(parents=True)
     (chrome_dir / "Default" / "Cookies").touch()
     (chrome_dir / "Profile 5").mkdir()
     (chrome_dir / "Profile 5" / "Cookies").touch()
 
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _patch_home(monkeypatch, tmp_path)
     monkeypatch.setenv("TWITTER_CHROME_PROFILE", "Profile 5")
 
     paths = auth._iter_chrome_cookie_files("chrome")
@@ -249,13 +249,13 @@ def test_iter_chrome_cookie_files_edge_linux_uses_microsoft_edge_path(monkeypatc
     (edge_dir / "Default").mkdir(parents=True)
     (edge_dir / "Default" / "Cookies").touch()
 
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _patch_home(monkeypatch, tmp_path)
     monkeypatch.delenv("TWITTER_CHROME_PROFILE", raising=False)
 
     paths = auth._iter_chrome_cookie_files("edge")
 
     assert len(paths) == 1
-    assert paths[0].endswith(".config/microsoft-edge/Default/Cookies")
+    assert paths[0] == os.path.join(str(tmp_path), ".config", "microsoft-edge", "Default", "Cookies")
 
 
 def test_iter_chrome_cookie_files_edge_windows_uses_user_data(monkeypatch, tmp_path) -> None:
@@ -412,3 +412,179 @@ def test_extract_in_process_returns_diagnostics_on_failure(monkeypatch) -> None:
 
     assert cookies is None
     assert any("cookie decryption" in d for d in diagnostics)
+
+
+def test_load_from_env_supports_full_cookie_string(monkeypatch) -> None:
+    monkeypatch.delenv("TWITTER_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("TWITTER_CT0", raising=False)
+    monkeypatch.setenv("TWITTER_COOKIE_STRING", "guest_id=v1; auth_token=tok123; ct0=csrf456; kdt=abc")
+
+    cookies = auth.load_from_env()
+
+    assert cookies == {
+        "auth_token": "tok123",
+        "ct0": "csrf456",
+        "cookie_string": "guest_id=v1; auth_token=tok123; ct0=csrf456; kdt=abc",
+    }
+
+
+def test_get_browser_order_prepends_custom_chromium_dir(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("TWITTER_BROWSER", raising=False)
+    monkeypatch.setenv("TWITTER_CHROMIUM_USER_DATA_DIR", str(tmp_path))
+
+    order = auth._get_browser_order()
+
+    assert order[0] == "custom-chromium"
+    assert "chrome" in order
+
+
+def test_iter_chrome_cookie_files_supports_custom_user_data_dir(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "Ungoogled Chromium"
+    network_dir = root / "Profile 1" / "Network"
+    network_dir.mkdir(parents=True)
+    cookie_file = network_dir / "Cookies"
+    cookie_file.touch()
+    local_state = root / "Local State"
+    local_state.touch()
+
+    monkeypatch.setenv("TWITTER_CHROMIUM_USER_DATA_DIR", str(root))
+    monkeypatch.delenv("TWITTER_CHROME_PROFILE", raising=False)
+
+    paths = auth._iter_chrome_cookie_files("custom-chromium")
+
+    assert paths == [str(cookie_file)]
+    assert auth._profile_name_from_cookie_file(str(cookie_file)) == "Profile 1"
+    assert auth._chromium_key_file_for_cookie(str(cookie_file)) == str(local_state)
+
+
+def test_extract_in_process_uses_chromium_loader_for_custom_dir(monkeypatch, tmp_path) -> None:
+    class Cookie:
+        def __init__(self, domain: str, name: str, value: str) -> None:
+            self.domain = domain
+            self.name = name
+            self.value = value
+
+    root = tmp_path / "User Data"
+    profile_dir = root / "Default" / "Network"
+    profile_dir.mkdir(parents=True)
+    cookie_file = profile_dir / "Cookies"
+    cookie_file.touch()
+    local_state = root / "Local State"
+    local_state.touch()
+    seen = {}
+
+    def chromium(cookie_file=None, key_file=None):
+        seen["cookie_file"] = cookie_file
+        seen["key_file"] = key_file
+        return [
+            Cookie(".x.com", "auth_token", "custom-token"),
+            Cookie(".x.com", "ct0", "custom-csrf"),
+        ]
+
+    monkeypatch.setenv("TWITTER_CHROMIUM_USER_DATA_DIR", str(root))
+    monkeypatch.setattr(auth, "_get_browser_order", lambda: ["custom-chromium"])
+    monkeypatch.setitem(sys.modules, "browser_cookie3", SimpleNamespace(chromium=chromium))
+
+    cookies, diagnostics = auth._extract_in_process()
+
+    assert diagnostics == []
+    assert cookies is not None
+    assert cookies["auth_token"] == "custom-token"
+    assert seen == {"cookie_file": str(cookie_file), "key_file": str(local_state)}
+
+
+def test_vivaldi_browser_order_and_paths(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("TWITTER_BROWSER", "vivaldi")
+    order = auth._get_browser_order()
+    assert order[0] == "vivaldi"
+    assert "vivaldi" in order
+
+    monkeypatch.setattr(auth.sys, "platform", "linux")
+    vivaldi_dir = tmp_path / ".config" / "vivaldi"
+    (vivaldi_dir / "Default").mkdir(parents=True)
+    (vivaldi_dir / "Default" / "Cookies").touch()
+    _patch_home(monkeypatch, tmp_path)
+    monkeypatch.delenv("TWITTER_CHROME_PROFILE", raising=False)
+
+    paths = auth._iter_chrome_cookie_files("vivaldi")
+    assert paths == [os.path.join(str(tmp_path), ".config", "vivaldi", "Default", "Cookies")]
+
+
+@pytest.mark.parametrize(
+    "platform,relative",
+    [
+        ("linux", ".zen/test/cookies.sqlite"),
+        ("linux", ".var/app/app.zen_browser.zen/zen/test/cookies.sqlite"),
+        ("linux", ".var/app/app.zen_browser.zen/.zen/test/cookies.sqlite"),
+        ("darwin", "Library/Application Support/zen/Profiles/test/cookies.sqlite"),
+        ("win32", "zen/Profiles/test/cookies.sqlite"),
+    ],
+)
+def test_zen_profile_discovery(monkeypatch, tmp_path, platform, relative) -> None:
+    monkeypatch.setattr(auth.sys, "platform", platform)
+    monkeypatch.setattr(auth.os.path, "expanduser", lambda _: str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    cookie_file = tmp_path / relative
+    cookie_file.parent.mkdir(parents=True)
+    cookie_file.touch()
+    assert auth._iter_zen_cookie_files() == [str(cookie_file)]
+
+
+@pytest.mark.parametrize("subprocess_mode", [False, True])
+def test_zen_extracts_from_later_profile(monkeypatch, subprocess_mode) -> None:
+    monkeypatch.setenv("TWITTER_BROWSER", " ZEN ")
+    monkeypatch.setattr(auth, "_iter_zen_cookie_files", lambda: ["empty", "broken", "valid"])
+    calls = []
+
+    def firefox(cookie_file=None):
+        calls.append(cookie_file)
+        if cookie_file == "broken":
+            raise RuntimeError("profile unreadable")
+        if cookie_file != "valid":
+            return []
+        return [
+            SimpleNamespace(domain=".x.com", name=name, value=value)
+            for name, value in [("auth_token", "token"), ("ct0", "csrf"), ("extra", "value")]
+        ]
+
+    fake_module = SimpleNamespace(firefox=firefox)
+    for name in ("arc", "chrome", "edge", "brave", "vivaldi"):
+        setattr(fake_module, name, lambda: pytest.fail("Zen should succeed first"))
+    monkeypatch.setitem(sys.modules, "browser_cookie3", fake_module)
+    if subprocess_mode:
+        import contextlib
+        import io
+
+        def run(cmd, **kwargs):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), pytest.raises(SystemExit) as exited:
+                exec(cmd[-1], {})
+            assert exited.value.code == 0
+            return SimpleNamespace(stdout=output.getvalue(), stderr="")
+
+        monkeypatch.setattr(auth.subprocess, "run", run)
+        cookies, _ = auth._extract_via_subprocess()
+    else:
+        cookies, _ = auth._extract_in_process()
+    assert calls == ["empty", "broken", "valid"]
+    assert cookies == {
+        "auth_token": "token",
+        "ct0": "csrf",
+        "cookie_string": "auth_token=token; ct0=csrf; extra=value",
+    }
+
+
+def test_windows_app_bound_encryption_diagnostics(monkeypatch) -> None:
+    monkeypatch.setattr(auth.sys, "platform", "win32")
+    for var in ("SSH_CLIENT", "SSH_TTY", "SSH_CONNECTION"):
+        monkeypatch.delenv(var, raising=False)
+
+    hint = auth._diagnose_keychain_issues(
+        ["chrome in-process extraction failed: Unable to get key for cookie decryption"]
+    )
+    assert hint is not None
+    assert "App-Bound Encryption" in hint
+    assert "not a permissions issue" in hint
+    assert "TWITTER_BROWSER=firefox" in hint
+    assert "TWITTER_COOKIE_STRING" in hint
+    assert "VSS shadowcopy" in hint

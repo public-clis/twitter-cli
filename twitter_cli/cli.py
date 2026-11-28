@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import re
 import sys
 import time
@@ -42,15 +43,22 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import click
+from click.shell_completion import get_completion_class
 from rich.console import Console
+from rich.table import Table
 import yaml
 
 from . import __version__
-from .auth import get_cookies
+from .article import article_markdown_to_content_state
+from .auth import get_cookies, load_from_env
 from .cache import resolve_cached_tweet, save_tweet_cache
-from .exceptions import TwitterError
-from .client import TwitterClient
-from .config import load_config
+from .exceptions import InvalidInputError, TwitterError
+try:
+    from .client import TwitterClient, _url_fetch
+except ImportError:  # pragma: no cover - allows `twitter doctor` to run when runtime deps are missing
+    TwitterClient = None  # type: ignore[assignment,misc]
+    _url_fetch = None  # type: ignore[assignment]
+from .config import _resolve_config_path, load_config
 from .filter import filter_tweets
 from .formatter import (
     article_to_markdown,
@@ -60,7 +68,9 @@ from .formatter import (
     print_tweet_table,
     print_user_profile,
     print_user_table,
+    set_time_style,
 )
+from .graphql import FALLBACK_QUERY_IDS, _QID_CACHE_TTL, _qid_cache_path, refresh_query_ids
 from .models import Tweet, UserProfile
 from .output import (
     default_structured_format,
@@ -96,6 +106,7 @@ FEED_TYPES = ["for-you", "following"]
 SEARCH_PRODUCTS = ["Top", "Latest", "Photos", "Videos"]
 SEARCH_HAS_CHOICES = ["links", "images", "videos", "media"]
 SEARCH_EXCLUDE_CHOICES = ["retweets", "replies", "links"]
+_COMPLETION_SHELLS = ("bash", "zsh", "fish")
 
 
 def _agent_user_profile(profile: UserProfile) -> dict:
@@ -201,7 +212,7 @@ def _normalize_tweet_id(value):
     """Extract a numeric tweet ID from raw input or a full X/Twitter URL."""
     raw = value.strip()
     if not raw:
-        raise RuntimeError("Tweet ID or URL is required")
+        raise InvalidInputError("Tweet ID or URL is required")
 
     parsed = urllib.parse.urlparse(raw)
     candidate = raw
@@ -209,14 +220,14 @@ def _normalize_tweet_id(value):
         path = parsed.path.rstrip("/")
         match = re.search(r"/(?:status|article)/(\d+)$", path)
         if not match:
-            raise RuntimeError("Invalid tweet URL: %s" % value)
+            raise InvalidInputError("Invalid tweet URL: %s" % value)
         candidate = match.group(1)
     else:
         candidate = raw.rstrip("/").split("/")[-1]
         candidate = candidate.split("?", 1)[0].split("#", 1)[0]
 
     if not candidate.isdigit():
-        raise RuntimeError("Invalid tweet ID: %s" % value)
+        raise InvalidInputError("Invalid tweet ID: %s" % value)
     return candidate
 
 
@@ -294,15 +305,28 @@ def _run_write_command(
 @click.group()
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
 @click.option("--compact", "-c", is_flag=True, help="Compact output (minimal fields, LLM-friendly).")
+@click.option(
+    "--time",
+    "time_style",
+    type=click.Choice(["relative", "absolute", "iso"]),
+    default=None,
+    help=(
+        "Timestamp style in human-readable output: relative (14d ago), "
+        "absolute (local datetime), or iso. Defaults to config display.time."
+    ),
+)
 @click.version_option(version=__version__)
 @click.pass_context
-def cli(ctx, verbose, compact):
-    # type: (Any, bool, bool) -> None
+def cli(ctx, verbose, compact, time_style):
+    # type: (Any, bool, bool, Optional[str]) -> None
     """twitter — Twitter/X CLI tool 🐦"""
     ensure_utf8_streams()
     _setup_logging(verbose)
     ctx.ensure_object(dict)
     ctx.obj["compact"] = compact
+    if time_style is None:
+        time_style = (load_config().get("display") or {}).get("time")
+    set_time_style(time_style)
 
 
 def _fetch_and_display(fetch_fn, label, emoji, max_count, as_json, as_yaml, output_file, do_filter, config=None, compact=False, full_text=False):
@@ -349,6 +373,27 @@ def _fetch_and_display(fetch_fn, label, emoji, max_count, as_json, as_yaml, outp
     console.print()
 
 
+def _print_news_table(stories, title="News stories"):
+    # type: (List[dict], str) -> None
+    """Print Explore News stories in a compact table."""
+    table = Table(title=title, show_lines=False)
+    table.add_column("#", justify="right", style="dim", width=4)
+    table.add_column("Story", style="bold", overflow="fold")
+    table.add_column("Context", overflow="fold")
+    table.add_column("Posts", justify="right")
+
+    for story in stories:
+        count = story.get("post_count")
+        table.add_row(
+            str(story.get("rank", "")),
+            str(story.get("title", "")),
+            str(story.get("context", "") or story.get("category", "") or ""),
+            f"{count:,}" if isinstance(count, int) and count > 0 else "",
+        )
+    console.print(table)
+    console.print()
+
+
 def _emit_timeline_structured(tweets, next_cursor, *, as_json, as_yaml):
     # type: (TweetList, Optional[str], bool, bool) -> bool
     """Emit timeline data with pagination metadata while keeping `data` a tweet list."""
@@ -358,25 +403,56 @@ def _emit_timeline_structured(tweets, next_cursor, *, as_json, as_yaml):
     return emit_structured(payload, as_json=as_json, as_yaml=as_yaml)
 
 
-def _run_bookmarks_command(max_count, as_json, as_yaml, output_file, do_filter, compact=False, full_text=False):
-    # type: (Optional[int], bool, bool, Optional[str], bool, bool, bool) -> None
+def _run_bookmarks_command(
+    max_count, as_json, as_yaml, output_file, do_filter, compact=False, full_text=False, cursor=None
+):
+    # type: (Optional[int], bool, bool, Optional[str], bool, bool, bool, Optional[str]) -> None
+    """Fetch bookmarks with optional cursor-based pagination."""
     config = load_config()
+    rich_output = use_rich_output(as_json=as_json, as_yaml=as_yaml, compact=compact)
 
     def _run():
-        client = _get_client(config)
-        _fetch_and_display(
-            lambda count: client.fetch_bookmarks(count),
-            "bookmarks",
-            "🔖",
-            max_count,
-            as_json,
-            as_yaml,
-            output_file,
-            do_filter,
-            config,
-            compact=compact,
+        client = _get_client(config, quiet=not rich_output)
+        fetch_count = _resolve_configured_count(config, max_count)
+        if rich_output:
+            console.print("🔖 Fetching bookmarks (%d tweets)...\n" % fetch_count)
+        start = time.time()
+        try:
+            result = client.fetch_bookmarks(fetch_count, cursor=cursor, return_cursor=True)
+        except TypeError:
+            result = (client.fetch_bookmarks(fetch_count), None)
+        if isinstance(result, tuple) and len(result) == 2:
+            tweets, next_cursor = result
+        else:
+            tweets, next_cursor = result, None
+        elapsed = time.time() - start
+        if rich_output:
+            console.print("✅ Fetched %d bookmarks in %.1fs\n" % (len(tweets), elapsed))
+
+        filtered = _apply_filter(tweets, do_filter, config, rich_output=rich_output)
+
+        if output_file:
+            Path(output_file).write_text(tweets_to_json(filtered), encoding="utf-8")
+            if rich_output:
+                console.print("💾 Saved to %s\n" % output_file)
+
+        if compact:
+            click.echo(tweets_to_compact_json(filtered))
+            return
+
+        save_tweet_cache(filtered)
+
+        if _emit_timeline_structured(filtered, next_cursor, as_json=as_json, as_yaml=as_yaml):
+            return
+
+        print_tweet_table(
+            filtered,
+            console,
+            title="🔖 Bookmarks — %d tweets" % len(filtered),
             full_text=full_text,
         )
+        _print_show_hint()
+        console.print()
 
     _run_guarded(_run)
 
@@ -509,13 +585,14 @@ def favorites(ctx, max_count, as_json, as_yaml, output_file, do_filter, full_tex
 
 @cli.group(name="bookmarks", invoke_without_command=True)
 @click.option("--max", "-n", "max_count", type=int, default=None, help="Max number of tweets to fetch.")
+@click.option("--cursor", type=str, default=None, help="Pagination cursor to continue a previous bookmarks fetch.")
 @structured_output_options
 @click.option("--output", "-o", "output_file", type=str, default=None, help="Save tweets to JSON file.")
 @click.option("--filter", "do_filter", is_flag=True, help="Enable score-based filtering.")
 @click.option("--full-text", is_flag=True, help="Show full tweet text in table output.")
 @click.pass_context
-def bookmarks(ctx, max_count, as_json, as_yaml, output_file, do_filter, full_text):
-    # type: (Any, Optional[int], bool, bool, Optional[str], bool, bool) -> None
+def bookmarks(ctx, max_count, cursor, as_json, as_yaml, output_file, do_filter, full_text):
+    # type: (Any, Optional[int], Optional[str], bool, bool, Optional[str], bool, bool) -> None
     """Fetch bookmarked tweets, or manage bookmark folders."""
     if ctx.invoked_subcommand is None:
         _run_bookmarks_command(
@@ -526,6 +603,7 @@ def bookmarks(ctx, max_count, as_json, as_yaml, output_file, do_filter, full_tex
             do_filter,
             compact=ctx.obj.get("compact", False),
             full_text=full_text,
+            cursor=cursor,
         )
 
 
@@ -825,18 +903,23 @@ def likes(ctx, screen_name, max_count, as_json, as_yaml, output_file, do_filter,
         # Warn if querying another user's likes (Twitter made likes private since June 2024)
         try:
             me = client.fetch_me()
-            if me.screen_name.lower() != screen_name.lower():
+            is_other_user = (
+                (me.id != profile.id)
+                if (me.id and profile.id)
+                else (me.screen_name.lower() != profile.screen_name.lower())
+            )
+            if is_other_user:
                 if rich_output:
                     console.print(
                         "\n[yellow]⚠️  Twitter/X made all likes private since June 2024. "
                         "You can only view your own likes. "
-                        "Querying @%s's likes will likely return empty results.[/yellow]\n" % screen_name
+                        "Querying @%s's likes will likely return empty results.[/yellow]\n" % profile.screen_name
                     )
                 else:
                     logger.warning(
                         "Twitter/X made likes private (June 2024). "
                         "Only your own likes are visible. @%s's likes will likely be empty.",
-                        screen_name,
+                        profile.screen_name,
                     )
         except Exception:
             pass  # Don't block the command if whoami fails
@@ -852,39 +935,53 @@ def likes(ctx, screen_name, max_count, as_json, as_yaml, output_file, do_filter,
 @cli.command()
 @click.argument("tweet_id")
 @click.option("--max", "-n", "max_count", type=int, default=None, help="Max replies to fetch.")
+@click.option("--cursor", type=str, default=None, help="Pagination cursor for continuing a thread fetch.")
 @click.option("--full-text", is_flag=True, help="Show full reply text in table output.")
 @structured_output_options
 @click.pass_context
-def tweet(ctx, tweet_id, max_count, full_text, as_json, as_yaml):
-    # type: (Any, str, int, bool, bool, bool) -> None
+def tweet(ctx, tweet_id, max_count, cursor, full_text, as_json, as_yaml):
+    # type: (Any, str, Optional[int], Optional[str], bool, bool, bool) -> None
     """View a tweet and its replies. TWEET_ID is the numeric tweet ID or full URL."""
     compact = ctx.obj.get("compact", False)
     tweet_id = _normalize_tweet_id(tweet_id)
     config = load_config()
     rich_output = use_rich_output(as_json=as_json, as_yaml=as_yaml, compact=compact)
+    next_cursor = None  # type: Optional[str]
     try:
         client = _get_client(config, quiet=not rich_output)
         if rich_output:
             console.print("🐦 Fetching tweet %s...\n" % tweet_id)
         start = time.time()
-        tweets = client.fetch_tweet_detail(tweet_id, _resolve_configured_count(config, max_count))
+        fetch_count = _resolve_configured_count(config, max_count)
+        try:
+            result = client.fetch_tweet_detail(
+                tweet_id, fetch_count, cursor=cursor, return_cursor=True
+            )
+        except TypeError:
+            result = (client.fetch_tweet_detail(tweet_id, fetch_count), None)
+        if isinstance(result, tuple) and len(result) == 2:
+            tweets, next_cursor = result
+        else:
+            tweets, next_cursor = result, None
         elapsed = time.time() - start
         if rich_output:
             console.print("✅ Fetched %d tweets in %.1fs\n" % (len(tweets), elapsed))
     except (TwitterError, RuntimeError) as exc:
         _exit_with_error(exc)
 
-    _emit_tweet_detail(tweets, compact=compact, as_json=as_json, as_yaml=as_yaml, full_text=full_text)
+    _emit_tweet_detail(
+        tweets, compact=compact, as_json=as_json, as_yaml=as_yaml, full_text=full_text, next_cursor=next_cursor
+    )
 
 
-def _emit_tweet_detail(tweets, compact, as_json, as_yaml, full_text):
-    # type: (list, bool, bool, bool, bool) -> None
+def _emit_tweet_detail(tweets, compact, as_json, as_yaml, full_text, next_cursor=None):
+    # type: (list, bool, bool, bool, bool, Optional[str]) -> None
     """Render tweet detail + replies in the requested output format."""
     if compact:
         click.echo(tweets_to_compact_json(tweets))
         return
 
-    if emit_structured(tweets_to_data(tweets), as_json=as_json, as_yaml=as_yaml):
+    if _emit_timeline_structured(tweets, next_cursor, as_json=as_json, as_yaml=as_yaml):
         return
 
     if tweets:
@@ -1005,6 +1102,68 @@ def article(ctx, tweet_id, as_json, as_yaml, as_markdown, output_file):
     console.print()
 
 
+@cli.command(name="article-publish")
+@click.argument("markdown_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--title", "-t", required=True, help="Article title.")
+@click.option("--draft", is_flag=True, help="Create a draft without publishing.")
+@structured_output_options
+def article_publish(markdown_file, title, draft, as_json, as_yaml):
+    # type: (str, str, bool, bool, bool) -> None
+    """Publish an X Article from a Markdown file."""
+    mode = _structured_mode(as_json=as_json, as_yaml=as_yaml)
+    clean_title = title.strip()
+    if not clean_title:
+        _handle_structured_runtime_error(
+            InvalidInputError("Article --title must not be empty."),
+            mode=mode,
+            details={"action": "article_publish", "draft": draft},
+        )
+        return
+
+    try:
+        markdown = Path(markdown_file).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        _handle_structured_runtime_error(
+            InvalidInputError("Failed to read UTF-8 Markdown file %s: %s" % (markdown_file, exc)),
+            mode=mode,
+            details={"action": "article_publish", "title": clean_title, "draft": draft},
+        )
+        return
+
+    if not markdown.strip():
+        _handle_structured_runtime_error(
+            InvalidInputError("Markdown file %s is empty." % markdown_file),
+            mode=mode,
+            details={"action": "article_publish", "title": clean_title, "draft": draft},
+        )
+        return
+
+    content_state = article_markdown_to_content_state(markdown)
+
+    def operation(client: TwitterClient) -> WritePayload:
+        result = client.create_article(clean_title, content_state, publish=not draft)
+        return {
+            "success": True,
+            "action": "article_publish",
+            "id": result["id"],
+            "title": result["title"],
+            "url": result["url"],
+            "published": result["published"],
+        }
+
+    action = "Creating article draft" if draft else "Publishing article"
+    payload = _run_write_command(
+        as_json=as_json,
+        as_yaml=as_yaml,
+        operation=operation,
+        progress_lines=["📝 %s..." % action],
+        success_lines=["[green]✅ Article %s![/green]" % ("draft created" if draft else "published")],
+        error_details={"action": "article_publish", "title": clean_title, "draft": draft},
+    )
+    if payload and not mode:
+        console.print("🔗 %s" % payload["url"])
+
+
 @cli.command(name="list")
 @click.argument("list_id")
 @click.option("--max", "-n", "max_count", type=int, default=None, help="Max tweets to fetch.")
@@ -1120,21 +1279,67 @@ def following(screen_name, max_count, as_json, as_yaml):
 # ── Write commands ──────────────────────────────────────────────────────
 
 _MAX_IMAGES = 4  # Twitter allows up to 4 images per tweet
+_MAX_VIDEOS = 1  # X allows 1 video per tweet (or up to 4 images, not both)
+_ALLOWED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+_ALLOWED_VIDEO_MIMES = {"video/mp4", "video/quicktime", "video/webm"}
 
 
-def _upload_images(client, image_paths, rich_output=True):
-    # type: (TwitterClient, tuple, bool) -> list
-    """Upload images and return list of media_id strings."""
-    if not image_paths:
-        return []
+def _validate_media_paths(image_paths, video_paths):
+    # type: (tuple, tuple) -> None
+    """Validate media counts, non-mixing, and MIME class before authenticating."""
     if len(image_paths) > _MAX_IMAGES:
         raise click.UsageError("Too many images: max %d, got %d" % (_MAX_IMAGES, len(image_paths)))
+    if len(video_paths) > _MAX_VIDEOS:
+        raise click.UsageError(
+            "Too many videos: max %d, got %d (X allows 1 video per tweet)" % (_MAX_VIDEOS, len(video_paths))
+        )
+    if image_paths and video_paths:
+        raise click.UsageError("Attach images OR a video, not both (X allows one media type per tweet)")
+    for path in image_paths:
+        mime = mimetypes.guess_type(path)[0] or ""
+        if mime not in _ALLOWED_IMAGE_MIMES:
+            raise click.UsageError(
+                "Unsupported image format for --image %s: %s (supported: jpeg, png, gif, webp)"
+                % (path, mime or "unknown")
+            )
+    for path in video_paths:
+        mime = mimetypes.guess_type(path)[0] or ""
+        if mime not in _ALLOWED_VIDEO_MIMES:
+            raise click.UsageError(
+                "Unsupported video format for --video %s: %s (supported: mp4, mov, webm)"
+                % (path, mime or "unknown")
+            )
+
+
+def _upload_images(client, image_paths, video_paths=None, rich_output=True):
+    # type: (TwitterClient, tuple, Optional[tuple], bool) -> list
+    """Upload images or a video and return list of media_id strings."""
+    image_paths = tuple(image_paths or ())
+    video_paths = tuple(video_paths or ())
+    if not image_paths and not video_paths:
+        return []
+    _validate_media_paths(image_paths, video_paths)
     media_ids = []
+    total = len(image_paths) + len(video_paths)
     for i, path in enumerate(image_paths, 1):
         if rich_output:
-            console.print("📤 Uploading image %d/%d: %s" % (i, len(image_paths), path))
+            console.print("📤 Uploading image %d/%d: %s" % (i, total, path))
+        media_ids.append(client.upload_media(path))
+    for i, path in enumerate(video_paths, 1):
+        if rich_output:
+            console.print("🎥 Uploading video %d/%d: %s" % (i, total, path))
         media_ids.append(client.upload_media(path))
     return media_ids
+
+
+def _normalize_tweet_id_guarded(tweet_id, *, mode, details):
+    # type: (str, StructuredMode, Dict[str, Any]) -> Optional[str]
+    """Normalize a tweet ID/URL, emitting structured errors on invalid input."""
+    try:
+        return _normalize_tweet_id(tweet_id)
+    except (TwitterError, RuntimeError) as exc:
+        _handle_structured_runtime_error(exc, mode=mode, details=details)
+        return None
 
 
 def _write_action(emoji, action_desc, client_method, tweet_id, as_json=False, as_yaml=False):
@@ -1144,42 +1349,60 @@ def _write_action(emoji, action_desc, client_method, tweet_id, as_json=False, as
     Emits structured JSON/YAML when piped or when OUTPUT env is set.
     """
     action_name = action_desc.lower().replace(" ", "_")
+    mode = _structured_mode(as_json=as_json, as_yaml=as_yaml)
+    normalized_id = _normalize_tweet_id_guarded(
+        tweet_id,
+        mode=mode,
+        details={"action": action_name, "id": tweet_id},
+    )
+    if normalized_id is None:
+        return
 
     def operation(client: TwitterClient) -> WritePayload:
-        getattr(client, client_method)(tweet_id)
-        return {"success": True, "action": action_name, "id": tweet_id}
+        getattr(client, client_method)(normalized_id)
+        return {"success": True, "action": action_name, "id": normalized_id}
 
     _run_write_command(
         as_json=as_json,
         as_yaml=as_yaml,
         operation=operation,
-        progress_lines=["%s %s %s..." % (emoji, action_desc, tweet_id)],
+        progress_lines=["%s %s %s..." % (emoji, action_desc, normalized_id)],
         success_lines=["[green]✅ Done.[/green]"],
-        error_details={"action": action_name, "id": tweet_id},
+        error_details={"action": action_name, "id": normalized_id},
     )
 
 
 @cli.command()
 @click.argument("text")
 @click.option("--reply-to", "-r", default=None, help="Reply to this tweet ID.")
-@click.option("--image", "-i", "images", multiple=True, type=click.Path(exists=True), help="Attach image (up to 4). Repeatable.")
+@click.option("--image", "-i", "images", multiple=True, type=click.Path(exists=True, dir_okay=False), help="Attach image (up to 4). Repeatable.")
+@click.option("--video", "-V", "videos", multiple=True, type=click.Path(exists=True, dir_okay=False), help="Attach video (max 1; mp4/mov/webm up to 512 MB).")
 @structured_output_options
-def post(text, reply_to, images, as_json, as_yaml):
-    # type: (str, Optional[str], tuple, bool, bool) -> None
+def post(text, reply_to, images, videos, as_json, as_yaml):
+    # type: (str, Optional[str], tuple, tuple, bool, bool) -> None
     """Post a new tweet. TEXT is the tweet content.
 
-    Attach images with --image / -i (up to 4):
+    Attach images with --image / -i (up to 4), or one video with --video / -V:
 
     \b
       twitter post "Hello!" --image photo.jpg
       twitter post "Gallery" -i a.png -i b.png -i c.jpg
+      twitter post "Clip:" --video clip.mp4
     """
-    normalized_reply_to = _normalize_tweet_id(reply_to) if reply_to else None
+    _validate_media_paths(images, videos)
+    mode = _structured_mode(as_json=as_json, as_yaml=as_yaml)
+    normalized_reply_to = None
+    if reply_to:
+        normalized_reply_to = _normalize_tweet_id_guarded(
+            reply_to, mode=mode, details={"action": "post", "replyTo": reply_to}
+        )
+        if normalized_reply_to is None:
+            return
     action = "Replying to %s" % normalized_reply_to if normalized_reply_to else "Posting tweet"
-    rich_output = not _structured_mode(as_json=as_json, as_yaml=as_yaml)
+    rich_output = not mode
 
     def operation(client: TwitterClient) -> WritePayload:
-        media_ids = _upload_images(client, images, rich_output=rich_output)
+        media_ids = _upload_images(client, images, video_paths=videos, rich_output=rich_output)
         tweet_id = client.create_tweet(text, reply_to_id=normalized_reply_to, media_ids=media_ids or None)
         return {"success": True, "action": "post", "id": tweet_id, "url": "https://x.com/i/status/%s" % tweet_id}
 
@@ -1191,28 +1414,36 @@ def post(text, reply_to, images, as_json, as_yaml):
         success_lines=["[green]✅ Tweet posted![/green]"],
         error_details={"action": "post", "replyTo": normalized_reply_to},
     )
-    if payload and not _structured_mode(as_json=as_json, as_yaml=as_yaml):
+    if payload and not mode:
         console.print("🔗 %s" % payload["url"])
 
 
 @cli.command(name="reply")
 @click.argument("tweet_id")
 @click.argument("text")
-@click.option("--image", "-i", "images", multiple=True, type=click.Path(exists=True), help="Attach image (up to 4). Repeatable.")
+@click.option("--image", "-i", "images", multiple=True, type=click.Path(exists=True, dir_okay=False), help="Attach image (up to 4). Repeatable.")
+@click.option("--video", "-V", "videos", multiple=True, type=click.Path(exists=True, dir_okay=False), help="Attach video (max 1; mp4/mov/webm up to 512 MB).")
 @structured_output_options
-def reply_tweet(tweet_id, text, images, as_json, as_yaml):
-    # type: (str, str, tuple, bool, bool) -> None
+def reply_tweet(tweet_id, text, images, videos, as_json, as_yaml):
+    # type: (str, str, tuple, tuple, bool, bool) -> None
     """Reply to a tweet. TWEET_ID is the tweet to reply to, TEXT is the reply content."""
-    tweet_id = _normalize_tweet_id(tweet_id)
-    rich_output = not _structured_mode(as_json=as_json, as_yaml=as_yaml)
+    _validate_media_paths(images, videos)
+    mode = _structured_mode(as_json=as_json, as_yaml=as_yaml)
+    normalized_id = _normalize_tweet_id_guarded(
+        tweet_id, mode=mode, details={"action": "reply", "replyTo": tweet_id}
+    )
+    if normalized_id is None:
+        return
+    rich_output = not mode
+
     def operation(client: TwitterClient) -> WritePayload:
-        media_ids = _upload_images(client, images, rich_output=rich_output)
-        new_id = client.create_tweet(text, reply_to_id=tweet_id, media_ids=media_ids or None)
+        media_ids = _upload_images(client, images, video_paths=videos, rich_output=rich_output)
+        new_id = client.create_tweet(text, reply_to_id=normalized_id, media_ids=media_ids or None)
         return {
             "success": True,
             "action": "reply",
             "id": new_id,
-            "replyTo": tweet_id,
+            "replyTo": normalized_id,
             "url": "https://x.com/i/status/%s" % new_id,
         }
 
@@ -1220,32 +1451,40 @@ def reply_tweet(tweet_id, text, images, as_json, as_yaml):
         as_json=as_json,
         as_yaml=as_yaml,
         operation=operation,
-        progress_lines=["💬 Replying to %s..." % tweet_id],
+        progress_lines=["💬 Replying to %s..." % normalized_id],
         success_lines=["[green]✅ Reply posted![/green]"],
-        error_details={"action": "reply", "replyTo": tweet_id},
+        error_details={"action": "reply", "replyTo": normalized_id},
     )
-    if payload and not _structured_mode(as_json=as_json, as_yaml=as_yaml):
+    if payload and not mode:
         console.print("🔗 %s" % payload["url"])
 
 
 @cli.command(name="quote")
 @click.argument("tweet_id")
 @click.argument("text")
-@click.option("--image", "-i", "images", multiple=True, type=click.Path(exists=True), help="Attach image (up to 4). Repeatable.")
+@click.option("--image", "-i", "images", multiple=True, type=click.Path(exists=True, dir_okay=False), help="Attach image (up to 4). Repeatable.")
+@click.option("--video", "-V", "videos", multiple=True, type=click.Path(exists=True, dir_okay=False), help="Attach video (max 1; mp4/mov/webm up to 512 MB).")
 @structured_output_options
-def quote_tweet(tweet_id, text, images, as_json, as_yaml):
-    # type: (str, str, tuple, bool, bool) -> None
+def quote_tweet(tweet_id, text, images, videos, as_json, as_yaml):
+    # type: (str, str, tuple, tuple, bool, bool) -> None
     """Quote-tweet a tweet. TWEET_ID is the tweet to quote, TEXT is the commentary."""
-    tweet_id = _normalize_tweet_id(tweet_id)
-    rich_output = not _structured_mode(as_json=as_json, as_yaml=as_yaml)
+    _validate_media_paths(images, videos)
+    mode = _structured_mode(as_json=as_json, as_yaml=as_yaml)
+    normalized_id = _normalize_tweet_id_guarded(
+        tweet_id, mode=mode, details={"action": "quote", "quotedId": tweet_id}
+    )
+    if normalized_id is None:
+        return
+    rich_output = not mode
+
     def operation(client: TwitterClient) -> WritePayload:
-        media_ids = _upload_images(client, images, rich_output=rich_output)
-        new_id = client.quote_tweet(tweet_id, text, media_ids=media_ids or None)
+        media_ids = _upload_images(client, images, video_paths=videos, rich_output=rich_output)
+        new_id = client.quote_tweet(normalized_id, text, media_ids=media_ids or None)
         return {
             "success": True,
             "action": "quote",
             "id": new_id,
-            "quotedId": tweet_id,
+            "quotedId": normalized_id,
             "url": "https://x.com/i/status/%s" % new_id,
         }
 
@@ -1253,12 +1492,12 @@ def quote_tweet(tweet_id, text, images, as_json, as_yaml):
         as_json=as_json,
         as_yaml=as_yaml,
         operation=operation,
-        progress_lines=["🔄 Quoting tweet %s..." % tweet_id],
+        progress_lines=["🔄 Quoting tweet %s..." % normalized_id],
         success_lines=["[green]✅ Quote tweet posted![/green]"],
-        error_details={"action": "quote", "quotedId": tweet_id},
+        error_details={"action": "quote", "quotedId": normalized_id},
     )
-    if payload and not _structured_mode(as_json=as_json, as_yaml=as_yaml):
-        console.print("🔗 %s" % payload["url"]) 
+    if payload and not mode:
+        console.print("🔗 %s" % payload["url"])
 
 
 @cli.command(name="status")
@@ -1436,6 +1675,195 @@ def unbookmark(tweet_id, as_json, as_yaml):
     _write_action("🔖", "Removing bookmark", "unbookmark_tweet", tweet_id, as_json=as_json, as_yaml=as_yaml)
 
 
+
+
+@cli.command(name="news")
+@click.option("--max", "-n", "max_count", type=click.IntRange(min=1), default=20, show_default=True, help="Max stories to return.")
+@structured_output_options
+def news(max_count, as_json, as_yaml):
+    # type: (int, bool, bool) -> None
+    """Fetch personalized stories from Explore > News."""
+    config = load_config()
+
+    def _run():
+        rich_output = use_rich_output(as_json=as_json, as_yaml=as_yaml)
+        client = _get_client(config, quiet=not rich_output)
+        if rich_output:
+            console.print("🗞️ Fetching Explore > News stories...\n")
+        stories = client.fetch_explore_news(count=max_count)
+
+        if emit_structured(stories, as_json=as_json, as_yaml=as_yaml):
+            return
+
+        _print_news_table(stories, title="🗞️ Explore News — %d stories" % len(stories))
+
+    _run_guarded(_run)
+
+
+@cli.command(name="completion")
+@click.argument("shell", type=click.Choice(sorted(_COMPLETION_SHELLS)))
+def completion(shell):
+    # type: (str) -> None
+    """Print a shell completion script for SHELL.
+
+    \b
+    bash:  twitter completion bash >> ~/.bashrc
+    zsh:   twitter completion zsh  > "${fpath[1]}/_twitter"
+    fish:  twitter completion fish > ~/.config/fish/completions/twitter.fish
+    """
+    completion_cls = get_completion_class(shell)
+    if completion_cls is None:  # pragma: no cover - guarded by Choice
+        raise click.ClickException("Shell completion is not supported for %r" % shell)
+    click.echo(completion_cls(cli, {}, "twitter", "_TWITTER_COMPLETE").source())
+
+
+@cli.command(name="doctor")
+@click.option("--refresh", is_flag=True, help="Refresh cached GraphQL query IDs from live sources.")
+@structured_output_options
+def doctor(refresh, as_json, as_yaml):
+    # type: (bool, bool, bool) -> None
+    """Run local diagnostics for dependencies, config, auth presence, and caches.
+
+    Never prints raw cookies or secrets.
+    """
+    checks = []  # type: List[Dict[str, Any]]
+
+    # 1. Dependency versions
+    try:
+        import curl_cffi
+        curl_ver = getattr(curl_cffi, "__version__", "unknown")
+    except Exception:
+        curl_ver = "missing"
+    try:
+        from importlib.metadata import version as _pkg_version
+        xct_ver = _pkg_version("xclienttransaction")
+    except Exception:
+        xct_ver = "missing"
+    deps_ok = curl_ver != "missing" and xct_ver != "missing"
+    checks.append({
+        "category": "deps",
+        "status": "pass" if deps_ok else "error",
+        "message": "curl_cffi=%s, xclienttransaction=%s" % (curl_ver, xct_ver),
+    })
+
+    # 2. Config resolution
+    resolved_cfg = _resolve_config_path(None)
+    checks.append({
+        "category": "config",
+        "status": "pass",
+        "message": str(resolved_cfg) if resolved_cfg else "built-in defaults",
+    })
+
+    # 3. Auth presence (metadata only — never reveal cookie values)
+    env_cookies = load_from_env()
+    if env_cookies:
+        source = "env:cookie_string" if env_cookies.get("cookie_string") else "env:tokens"
+        checks.append({
+            "category": "auth",
+            "status": "pass",
+            "message": "Credentials present (%s)" % source,
+        })
+    else:
+        checks.append({
+            "category": "auth",
+            "status": "warning",
+            "message": "No env credentials set; commands will attempt browser cookie extraction",
+        })
+
+    # 4. Transaction cache status
+    ct_path = Path(
+        TwitterClient._ct_cache_path()
+        if TwitterClient is not None
+        else str(Path.home() / ".twitter-cli" / "transaction_cache.json")
+    )
+    if ct_path.exists():
+        try:
+            ct_payload = json.loads(ct_path.read_text(encoding="utf-8"))
+            age_s = int(time.time() - float(ct_payload.get("created_at", 0)))
+            fresh = age_s <= 3600
+            checks.append({
+                "category": "tx_cache",
+                "status": "pass" if fresh else "warning",
+                "message": "Transaction cache %s (age=%ds)" % ("fresh" if fresh else "expired", age_s),
+            })
+        except Exception as exc:
+            checks.append({
+                "category": "tx_cache",
+                "status": "warning",
+                "message": "Transaction cache unreadable: %s" % exc,
+            })
+    else:
+        checks.append({
+            "category": "tx_cache",
+            "status": "warning",
+            "message": "Transaction cache not initialized yet",
+        })
+
+    # 5. Query IDs cache / live refresh
+    qid_path = _qid_cache_path()
+    if refresh:
+        if _url_fetch is None:
+            checks.append({
+                "category": "query_ids",
+                "status": "error",
+                "message": "Cannot refresh live queryIds: HTTP client dependencies are missing",
+            })
+        else:
+            refreshed = refresh_query_ids(_url_fetch)
+            checks.append({
+                "category": "query_ids",
+                "status": "pass" if refreshed else "warning",
+                "message": "Refreshed %d live queryIds (fallback baseline: %d)" % (
+                    len(refreshed), len(FALLBACK_QUERY_IDS)
+                ),
+            })
+    else:
+        if qid_path.exists():
+            try:
+                qid_payload = json.loads(qid_path.read_text(encoding="utf-8"))
+                cached_count = len(qid_payload.get("query_ids", {}))
+                age_s = int(time.time() - float(qid_payload.get("created_at", 0)))
+                fresh = age_s <= _QID_CACHE_TTL
+                checks.append({
+                    "category": "query_ids",
+                    "status": "pass" if fresh else "warning",
+                    "message": "Fallback baseline=%d, disk cache=%d (%s, age=%ds)" % (
+                        len(FALLBACK_QUERY_IDS),
+                        cached_count,
+                        "fresh" if fresh else "expired",
+                        age_s,
+                    ),
+                })
+            except Exception as exc:
+                checks.append({
+                    "category": "query_ids",
+                    "status": "warning",
+                    "message": "Query ID cache unreadable: %s" % exc,
+                })
+        else:
+            checks.append({
+                "category": "query_ids",
+                "status": "pass",
+                "message": "Fallback baseline=%d, disk cache=0" % len(FALLBACK_QUERY_IDS),
+            })
+
+    has_error = any(item["status"] == "error" for item in checks)
+    if emit_structured({"checks": checks}, as_json=as_json, as_yaml=as_yaml):
+        if has_error:
+            sys.exit(1)
+        return
+
+    table = Table(title="🩺 twitter-cli doctor")
+    table.add_column("Check", style="cyan")
+    table.add_column("Status", style="bold")
+    table.add_column("Details")
+    for item in checks:
+        icon = "✅" if item["status"] == "pass" else ("⚠️" if item["status"] == "warning" else "❌")
+        table.add_row(item["category"], "%s %s" % (icon, item["status"]), item["message"])
+    console.print(table)
+    console.print()
+    if has_error:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

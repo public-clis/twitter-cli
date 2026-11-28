@@ -83,3 +83,20 @@ class TestReadOnly:
         result, payload = _invoke("feed", "--max", "3")
         assert result.exit_code == 0, f"feed failed: {result.output}"
         assert payload["ok"] is True
+
+
+@smoke
+class TestCTGatedReads:
+    """Endpoints that 404 without x-client-transaction-id."""
+
+    def test_followers(self):
+        result, payload = _invoke("followers", "elonmusk", "--max", "3")
+        assert result.exit_code == 0, f"followers failed: {result.output}"
+        assert payload["ok"] is True
+        assert len(payload["data"]) >= 1
+
+    def test_following(self):
+        result, payload = _invoke("following", "elonmusk", "--max", "3")
+        assert result.exit_code == 0, f"following failed: {result.output}"
+        assert payload["ok"] is True
+        assert len(payload["data"]) >= 1
