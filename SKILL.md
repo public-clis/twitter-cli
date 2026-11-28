@@ -2,7 +2,7 @@
 name: twitter-cli
 description: Use twitter-cli for ALL Twitter/X operations — reading tweets, posting, replying, quoting, liking, retweeting, following, searching, user lookups. Invoke whenever user requests any Twitter interaction.
 author: jackwener
-version: "0.8.6"
+version: "0.9.0"
 tags:
   - twitter
   - x
